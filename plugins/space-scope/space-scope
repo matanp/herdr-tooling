@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Scope Herdr's Agents panel to the space you are in.
+
+usage: space-scope [on|off|toggle|status]
+
+on      filter the Agents panel to the presented workspace (default)
+off     restore the full cross-space panel
+toggle  flip between the two
+status  print the last mode this tool applied
+
+The API has no way to read the active agent view back, so toggle and status
+consult a mode file this tool owns. A server restart re-runs the plugin's
+startup hook, which rewrites it; the panel header is the real display, showing
+the view label when scoped and the sort mode when not.
+"""
+
+import json
+import os
+import socket
+import sys
+
+SOURCE = "space-scope"
+LABEL = "this space"
+MODE_FILE = os.path.expanduser("~/.local/state/herdr-space-scope/mode")
+
+
+def socket_path():
+    return os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
+        "~/.config/herdr/herdr.sock"
+    )
+
+
+def read_mode():
+    try:
+        with open(MODE_FILE) as handle:
+            mode = handle.read().strip()
+    except OSError:
+        return "off"
+    return mode if mode in ("on", "off") else "off"
+
+
+def write_mode(mode):
+    try:
+        os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
+        temporary = MODE_FILE + ".tmp"
+        with open(temporary, "w") as handle:
+            handle.write(mode + "\n")
+        os.replace(temporary, MODE_FILE)
+    except OSError as err:
+        print(f"space-scope: could not record mode: {err}", file=sys.stderr)
+
+
+def request(payload):
+    path = socket_path()
+    if not os.path.exists(path):
+        sys.exit(f"space-scope: no herdr server socket at {path}")
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(5)
+    try:
+        conn.connect(path)
+        conn.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError as err:
+        sys.exit(f"space-scope: {payload['method']} failed: {err}")
+    finally:
+        conn.close()
+    try:
+        return json.loads(buf.split(b"\n", 1)[0])
+    except ValueError:
+        sys.exit(f"space-scope: unreadable response: {buf!r}")
+
+
+def apply(mode):
+    if mode == "on":
+        payload = {
+            "id": SOURCE,
+            "method": "agent.view.set",
+            "params": {
+                "source": SOURCE,
+                "label": LABEL,
+                "filter": {
+                    "op": "eq",
+                    "field": "workspace_id",
+                    "value": {"context": "current_workspace_id"},
+                },
+            },
+        }
+    else:
+        payload = {
+            "id": SOURCE,
+            "method": "agent.view.clear",
+            "params": {"source": SOURCE},
+        }
+
+    response = request(payload)
+    if "error" in response:
+        error = response["error"]
+        sys.exit(f"space-scope: {error.get('code')}: {error.get('message')}")
+    write_mode(mode)
+    print(json.dumps(response.get("result", response)))
+
+
+def main(argv):
+    mode = argv[1] if len(argv) > 1 else "on"
+    if mode in ("-h", "--help"):
+        print(__doc__.strip())
+    elif mode == "status":
+        print(read_mode())
+    elif mode == "toggle":
+        apply("off" if read_mode() == "on" else "on")
+    elif mode in ("on", "off"):
+        apply(mode)
+    else:
+        sys.exit(f"space-scope: unknown mode {mode!r} (expected on, off, toggle, status)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

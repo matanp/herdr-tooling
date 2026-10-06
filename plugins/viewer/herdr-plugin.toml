@@ -1,0 +1,25 @@
+id = "viewer"
+name = "File viewer"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Floating Markdown and code viewer over the focused pane's directory"
+platforms = ["linux", "macos"]
+
+# The CLI's --placement offers no popup, so `view popup` opens this entrypoint
+# over the socket and hands it the target directory and file through env.
+[[panes]]
+id = "popup"
+title = "File viewer"
+description = "Pick a file, preview it, Enter to read in less, ctrl-y to copy, Esc to close"
+placement = "popup"
+command = ["./view", "tui"]
+
+[[actions]]
+id = "popup"
+title = "Viewer: browse files"
+command = ["./view", "popup"]
+
+[[actions]]
+id = "copy"
+title = "Viewer: copy a file's contents"
+command = ["./view", "copy"]

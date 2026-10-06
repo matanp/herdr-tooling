@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""herdr-compose: write the next agent prompt in nvim, in a split under the agent.
+
+usage:
+  herdr-compose toggle            open the compose split under the active agent pane,
+                                  or close it (from either pane)
+  herdr-compose send              paste the draft into the agent and submit it
+                                  (nvim's <C-s>; reads HERDR_COMPOSE_* from env)
+  herdr-compose nav CMD           ccnav-herdr CMD, retargeted from a compose pane
+                                  to its agent (prev/next/newest/bottom/...)
+  herdr-compose scroll up|down    scroll the agent half a page, same retargeting
+  herdr-compose history [N]       print the last N sent prompts
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+    "~/.local/state"), "herdr-compose")
+PANES = os.path.join(STATE, "panes")
+DRAFTS = os.path.join(STATE, "drafts")
+HISTORY = os.path.join(STATE, "history.jsonl")
+LOG = os.path.join(STATE, "compose.log")
+NVIM_INIT = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                         "..", "share", "herdr-compose", "compose.lua")
+CCNAV = os.path.expanduser("~/.local/bin/ccnav-herdr")
+SPLIT_RATIO = 0.7
+PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+
+
+class Fail(Exception):
+    pass
+
+
+def log(msg):
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
+
+
+def api(*args):
+    p = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=20)
+    for stream in (p.stdout, p.stderr):
+        try:
+            d = json.loads(stream)
+        except ValueError:
+            continue
+        if "error" in d:
+            raise Fail("herdr %s: %s" % (args[0:2], d["error"].get("message")))
+        return d.get("result", {})
+    if p.returncode != 0:
+        raise Fail("herdr %s: %s" % (" ".join(args), (p.stderr or p.stdout).strip()[:200]))
+    return {}
+
+
+def snapshot():
+    return api("api", "snapshot")["snapshot"]
+
+
+def find_pane(snap, pane_id):
+    return next((p for p in snap["panes"] if p["pane_id"] == pane_id), None)
+
+
+def active_pane(snap=None):
+    # [[keys.command]] sets this to the pane focused at keypress time.
+    return os.environ.get("HERDR_ACTIVE_PANE_ID") or (snap or snapshot())["focused_pane_id"]
+
+
+# --- compose-pane registry ------------------------------------------------
+# One file per compose pane, named by its pane id, holding the agent it feeds.
+# pane_id rather than terminal_id because both lookups start from a pane id
+# herdr hands us; an old pane_id still resolves after a move.
+
+def record(compose_pane, info):
+    os.makedirs(PANES, exist_ok=True)
+    with open(os.path.join(PANES, compose_pane.replace(":", "_")), "w") as fh:
+        json.dump(info, fh)
+
+
+def lookup(compose_pane):
+    try:
+        with open(os.path.join(PANES, compose_pane.replace(":", "_"))) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def forget(compose_pane):
+    try:
+        os.remove(os.path.join(PANES, compose_pane.replace(":", "_")))
+    except OSError:
+        pass
+
+
+def compose_for(agent_pane, snap):
+    live = {p["pane_id"] for p in snap["panes"]}
+    for name in os.listdir(PANES) if os.path.isdir(PANES) else []:
+        info = lookup(name)
+        if not info:
+            continue
+        if info["compose"] not in live:
+            forget(name)
+        elif info["target"] == agent_pane:
+            return info["compose"]
+    return None
+
+
+def resolve_target(pane):
+    """A compose pane stands in for its agent; any other pane is itself."""
+    info = lookup(pane)
+    return info["target"] if info else pane
+
+
+# --- commands -------------------------------------------------------------
+
+def toggle():
+    snap = snapshot()
+    pane = active_pane(snap)
+    if (info := lookup(pane)) or (info := lookup(compose_for(pane, snap) or "")):
+        forget(info["compose"])
+        api("pane", "close", info["compose"])
+        log("close %s" % info["compose"])
+        return
+    target = find_pane(snap, pane)
+    if not target:
+        raise Fail("no pane %s in the snapshot" % pane)
+    os.makedirs(DRAFTS, exist_ok=True)
+    draft = os.path.join(DRAFTS, "%s.md" % target["terminal_id"])
+    is_claude = any(a["pane_id"] == pane and a.get("agent") == "claude"
+                    for a in snap.get("agents", []))
+    if is_claude and target.get("agent_status") != "blocked" and (taken := take_composer(pane)):
+        try:
+            with open(draft) as fh:
+                kept = fh.read().strip("\n")
+        except OSError:
+            kept = ""
+        with open(draft, "w") as fh:
+            fh.write((kept + "\n\n" if kept else "") + taken + "\n")
+        log("took %d chars from %s composer" % (len(taken), pane))
+    res = api("pane", "split", pane, "--direction", "down", "--ratio", str(SPLIT_RATIO),
+              "--cwd", target.get("foreground_cwd") or target.get("cwd") or os.getcwd(),
+              "--env", "HERDR_COMPOSE_TARGET=%s" % pane,
+              "--env", "HERDR_COMPOSE_DRAFT=%s" % draft,
+              "--focus")
+    compose = res["pane"]["pane_id"]
+    record(compose, {"compose": compose, "target": pane, "draft": draft})
+    api("pane", "rename", compose, "compose")
+    wait_for_prompt(compose)
+    api("pane", "run", compose, "exec nvim -S %s %s" % (
+        os.path.realpath(NVIM_INIT), draft))
+    log("open %s -> %s" % (compose, pane))
+
+
+COMPOSER = "❯ "   # ❯ + NBSP; a submitted turn is ❯ + ASCII space
+RULE = "─"
+PLACEHOLDER = re.compile(r"^(\x1b\[0m)*\x1b\[2m")
+OPAQUE = re.compile(r"\[(Pasted text|Image) #\d+")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
+
+
+def read_composer(pane):
+    """Claude Code's unsent draft as (text, rows), or None if there isn't one.
+
+    Claude Code wraps the composer itself, so soft and hard newlines look the
+    same on screen and are told apart by width (see unwrap).
+    """
+    p = subprocess.run([HERDR, "pane", "read", pane, "--source", "recent", "--lines", "80",
+                        "--format", "ansi"], capture_output=True, text=True)
+    raw = p.stdout.split("\n")
+    plain = [ANSI.sub("", r) for r in raw]
+    starts = [i for i, r in enumerate(plain) if r.startswith(COMPOSER)]
+    if not starts:
+        return None
+    first = starts[-1]
+    end = next((i for i in range(first + 1, len(plain)) if plain[i].startswith(RULE)), None)
+    if end is None:
+        return None
+    # An empty composer shows a dim "Try ..." hint where the text would be.
+    head = raw[first].replace("\r", "").partition(COMPOSER)[2]
+    if not head or PLACEHOLDER.match(head):
+        return None
+    width = len(plain[end].rstrip()) - 2
+    rows = [r[2:].rstrip() for r in plain[first:end]]
+    while rows and not rows[-1]:
+        rows.pop()
+    text = unwrap(rows, width)
+    return (text, len(rows)) if text.strip() else None
+
+
+def unwrap(rows, width):
+    # A row is a soft wrap of the previous one when its first word could not
+    # have fitted there. A token longer than a whole row is hard-broken at
+    # exactly `width` with no space, so a full row followed by an over-long
+    # joined token rejoins without one.
+    out, prev = [], None
+    for row in rows:
+        word = row.split(" ", 1)[0]
+        if not out or not prev or not row or row[0] == " ":
+            out.append(row)
+        elif (len(prev) + 2 >= width
+              and len(prev.rsplit(" ", 1)[-1]) + len(word) > width - 2):
+            out[-1] += row
+        elif len(prev) + 2 + 1 + len(word) > width:
+            out[-1] += " " + row
+        else:
+            out.append(row)
+        prev = row
+    return "\n".join(out)
+
+
+def take_composer(pane):
+    """Move Claude Code's draft out of its composer; returns the text or None."""
+    got = read_composer(pane)
+    if not got:
+        return None
+    text, nrows = got
+    # The real text behind a collapsed paste isn't on screen; clearing would lose it.
+    if OPAQUE.search(text):
+        log("composer %s holds a collapsed paste; left in place" % pane)
+        return None
+    # ctrl+e/u/k never interrupt a running turn; Esc and ctrl+c would.
+    for _ in range(nrows * 2 + 4):
+        api("pane", "send-keys", pane, "ctrl+e", "ctrl+u", "ctrl+k")
+        time.sleep(0.05)
+        if not read_composer(pane):
+            return text
+    log("composer %s did not clear; draft copied, not moved" % pane)
+    return text
+
+
+def wait_for_prompt(pane, timeout=5.0):
+    # Input sent before the shell draws its prompt is dropped.
+    end = time.time() + timeout
+    while time.time() < end:
+        p = subprocess.run([HERDR, "pane", "read", pane, "--source", "visible",
+                            "--format", "text"], capture_output=True, text=True)
+        if p.stdout.strip():
+            return
+        time.sleep(0.05)
+    raise Fail("compose pane %s never drew a prompt" % pane)
+
+
+def send():
+    target = os.environ.get("HERDR_COMPOSE_TARGET")
+    draft = os.environ.get("HERDR_COMPOSE_DRAFT")
+    if not (target and draft):
+        raise Fail("not in a compose pane (HERDR_COMPOSE_TARGET unset)")
+    with open(draft) as fh:
+        text = fh.read().strip("\n")
+    if not text.strip():
+        raise Fail("draft is empty")
+    pane = find_pane(snapshot(), target)
+    if not pane:
+        raise Fail("agent pane %s is gone" % target)
+    # Text arriving while the agent shows a permission prompt would answer it.
+    if pane.get("agent_status") == "blocked":
+        raise Fail("agent is blocked on a prompt")
+    # Bracketed paste, or each newline in the draft submits a separate turn.
+    api("pane", "send-text", target, PASTE_START + text + PASTE_END)
+    api("pane", "send-keys", target, "Enter")
+    os.makedirs(STATE, exist_ok=True)
+    with open(HISTORY, "a") as fh:
+        fh.write(json.dumps({"ts": int(time.time()), "target": target,
+                             "terminal_id": pane["terminal_id"],
+                             "title": pane.get("terminal_title_stripped"),
+                             "text": text}) + "\n")
+    log("send %s (%d chars)" % (target, len(text)))
+
+
+def nav(args):
+    pane = resolve_target(active_pane())
+    env = dict(os.environ, CCNAV_HERDR_PANE=pane)
+    env.pop("HERDR_ACTIVE_PANE_ID", None)
+    os.execve(CCNAV, [CCNAV, *args], env)
+
+
+def scroll(direction):
+    if direction not in ("up", "down"):
+        raise Fail("scroll takes up or down")
+    pane = resolve_target(active_pane())
+    loader = importlib.machinery.SourceFileLoader("ccnav_herdr", CCNAV)
+    spec = importlib.util.spec_from_loader("ccnav_herdr", loader)
+    ccnav = importlib.util.module_from_spec(spec)
+    loader.exec_module(ccnav)
+    info = ccnav.pane_info(pane)
+    cols, rows = ccnav.geometry(pane, info)
+    ccnav.scroll(pane, direction, max(1, rows // 2), cols, rows)
+
+
+def history(n=10):
+    try:
+        with open(HISTORY) as fh:
+            rows = [json.loads(line) for line in fh][-n:]
+    except OSError:
+        return
+    for r in rows:
+        print("── %s  %s" % (time.strftime("%m-%d %H:%M", time.localtime(r["ts"])),
+                             r.get("title") or r["target"]))
+        print(r["text"])
+
+
+def main(argv):
+    if not argv:
+        sys.exit(__doc__)
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "toggle":
+            toggle()
+        elif cmd == "send":
+            send()
+        elif cmd == "nav" and rest:
+            nav(rest)
+        elif cmd == "scroll" and rest:
+            scroll(rest[0])
+        elif cmd == "history":
+            history(int(rest[0]) if rest else 10)
+        else:
+            sys.exit(__doc__)
+    except Fail as err:
+        log("fail %s: %s" % (cmd, err))
+        sys.exit("herdr-compose: %s" % err)
+    except Exception as err:
+        if type(err).__name__ in ("Fail", "Refused"):  # ccnav-herdr's own
+            log("fail %s: %s" % (cmd, err))
+            sys.exit("herdr-compose: %s" % err)
+        raise
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

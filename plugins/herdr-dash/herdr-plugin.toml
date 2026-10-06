@@ -1,0 +1,49 @@
+id = "herdr-dash"
+name = "Dashboard"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Tab verdicts, agents, memory by pane, notes, prefixes and MEMORY.md health in one view"
+platforms = ["linux"]
+
+# Two entrypoints, one renderer. The tab stays put and is scriptable; the popup
+# is opened from a key binding and is invisible to tooling -- it carries no pane
+# id and never appears in `pane list`, so nothing can target it afterwards.
+
+[[panes]]
+id = "dash"
+title = "Dashboard"
+description = "Open the dashboard as a tab"
+placement = "tab"
+command = ["./run", "tui"]
+
+# The popup drops agents -- the sidebar and the built-in Agents panel already
+# carry it -- and folds the cheat-sheet, which is reference rather than status.
+# Everything it summarises is rendered in full by the tab entrypoint.
+[[panes]]
+id = "popup"
+title = "Dashboard (popup)"
+description = "Floating dashboard, dismissed with q"
+placement = "popup"
+width = "86%"
+height = "80%"
+command = [
+  "./run", "tui",
+  "--sections", "tabs,memory,worktrees,index,keys,notes",
+  "--collapsed", "keys",
+  "--brief", "tabs,memory,index,worktrees",
+]
+
+[[actions]]
+id = "tab"
+title = "Dashboard: open as tab"
+command = ["./run", "open-tab"]
+
+[[actions]]
+id = "popup"
+title = "Dashboard: popup"
+command = ["./run", "popup"]
+
+[[actions]]
+id = "close-popup"
+title = "Dashboard: close popup"
+command = ["./run", "close-popup"]

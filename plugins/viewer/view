@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Floating file viewer for herdr: fuzzy picker, rendered preview, less for reading.
+
+usage:
+  view popup [PATH]   open the viewer popup; no PATH means the focused pane's cwd,
+                      a file PATH opens straight into the reader
+  view tui            the popup's own entrypoint (reads VIEWER_CWD / VIEWER_FILE)
+  view reopen         reopen the popup at the other size once the current one closes
+  view show FILE      render FILE into less in the current terminal, no herdr needed
+  view copy [--path] [FILE[:N[-M]]]
+                      put FILE's contents (or lines N-M, or with --path its absolute
+                      path) on the clipboard via OSC 52; no FILE opens the picker in
+                      copy mode, where enter copies and closes
+"""
+
+import base64
+import io
+import json
+import os
+import re
+import select
+import socket
+import stat
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+from rich import box
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.text import Text
+
+PLUGIN_ID = "viewer"
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+POPUP_SIZE = ("92%", "88%")
+FULL_SIZE = ("100%", "100%")
+FULL_FLAG = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+    "~/.local/state"), "herdr-viewer", "full")
+MARKDOWN = {".md", ".markdown", ".mdx"}
+MARKDOWN_MAX_WIDTH = 110
+PREVIEW_BYTES = 64_000
+PAGE_BYTES = 5_000_000
+THEME = "ansi_dark"
+FOOTER = Text("↑↓ move   enter read   ctrl-y copy   alt-y copy path   tab complete   "
+              "/ ~ ./ browse paths   ctrl-u clear   ctrl-f full screen   esc close",
+              style="dim")
+COPY_FOOTER = Text("↑↓ move   enter copy and close   alt-y copy path   tab complete   "
+                   "ctrl-u clear   esc close", style="dim")
+# Unmeasured: the most Herdr will forward in one pane OSC 52 write.
+COPY_MAX_BYTES = 1_000_000
+# A trailing :N, :N-M or :N:col, as in compiler output and `file_path:line` citations.
+LINE_SUFFIX = re.compile(r":(\d+)(?:-(\d+)|:\d+)?$")
+PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+PATH_PREFIXES = ("/", "~", "./", "../")
+ESCAPES = {
+    "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+    "\x1b[5~": "pgup", "\x1b[6~": "pgdn", "\x1by": "copy-path",
+}
+CONTROLS = {
+    "\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace",
+    "\x10": "up", "\x0e": "down", "\x15": "clear", "\x17": "word", "\x03": "quit",
+    "\t": "tab", "\x06": "resize", "\x19": "copy",
+}
+
+
+# --- herdr ----------------------------------------------------------------
+
+def herdr_call(method, params):
+    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
+        "~/.config/herdr/herdr.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect(path)
+        payload = {"id": PLUGIN_ID, "method": method, "params": params}
+        conn.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    response = json.loads(buf.split(b"\n", 1)[0])
+    if "error" in response:
+        err = response["error"]
+        raise RuntimeError(f"{method}: {err.get('code')}: {err.get('message')}")
+    return response.get("result", {})
+
+
+def focused_cwd():
+    out = subprocess.run([HERDR, "pane", "list"], capture_output=True, text=True).stdout
+    try:
+        panes = json.loads(out)["result"]["panes"]
+    except (ValueError, KeyError):
+        return os.getcwd()
+    pane = next((p for p in panes if p.get("focused")), {})
+    return pane.get("foreground_cwd") or pane.get("cwd") or os.getcwd()
+
+
+def open_popup(args):
+    if args:
+        target = os.path.abspath(os.path.expanduser(args[0]))
+        if not os.path.exists(target):
+            sys.exit(f"view: no such file or directory: {target}")
+        is_file = os.path.isfile(target)
+        cwd, file = (os.path.dirname(target), target) if is_file else (target, "")
+    else:
+        cwd, file = focused_cwd(), ""
+    launch({"VIEWER_CWD": cwd, "VIEWER_FILE": file})
+
+
+def launch(env):
+    width, height = FULL_SIZE if os.path.exists(FULL_FLAG) else POPUP_SIZE
+    herdr_call("plugin.pane.open", {
+        "plugin_id": PLUGIN_ID,
+        "entrypoint": "popup",
+        "placement": "popup",
+        "width": width,
+        "height": height,
+        "focus": True,
+        "env": env,
+    })
+
+
+def reopen():
+    # herdr refuses a second popup, and the one that spawned us is still closing.
+    env = {k: os.environ.get(k, "") for k in ("VIEWER_CWD", "VIEWER_QUERY", "VIEWER_SELECTED",
+                                        "VIEWER_MODE")}
+    for _ in range(60):
+        try:
+            launch(env)
+            return
+        except RuntimeError as err:
+            if "already open" not in str(err):
+                raise
+            time.sleep(0.05)
+
+
+def toggle_full():
+    if os.path.exists(FULL_FLAG):
+        os.remove(FULL_FLAG)
+    else:
+        os.makedirs(os.path.dirname(FULL_FLAG), exist_ok=True)
+        open(FULL_FLAG, "w").close()
+
+
+# --- rendering ------------------------------------------------------------
+
+def is_markdown(path):
+    return os.path.splitext(path)[1].lower() in MARKDOWN
+
+
+def render_lines(path, width, limit, color_system, wrap):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit + 1)
+    except OSError as err:
+        return [f"cannot read: {err.strerror}"]
+    if b"\0" in data[:8192]:
+        return ["binary file"]
+    text = data[:limit].decode("utf-8", "replace")
+    buf = io.StringIO()
+    con = Console(file=buf, force_terminal=True, color_system=color_system,
+                  width=min(width, MARKDOWN_MAX_WIDTH) if is_markdown(path) else width)
+    if is_markdown(path):
+        con.print(Markdown(text, code_theme=THEME, hyperlinks=False))
+    else:
+        lexer = Syntax.guess_lexer(path, code=text)
+        con.print(Syntax(text, lexer, theme=THEME, line_numbers=True, word_wrap=wrap,
+                         background_color="default"))
+    if len(data) > limit:
+        con.print(Text(f"… truncated at {limit // 1000} kB", style="dim"))
+    return buf.getvalue().splitlines()
+
+
+def page(path, console):
+    lines = render_lines(path, console.width, PAGE_BYTES,
+                         console.color_system or "standard", wrap=True)
+    prompt = "".join("\\" + c if c in "?:.%\\" else c for c in path)
+    # A user LESS carrying -F would quit at once on a short file and close the popup.
+    env = {**os.environ, "LESS": ""}
+    subprocess.run(["less", "-R", "-Ps" + prompt + "  (q back, / search)"],
+                   input="\n".join(lines) + "\n", text=True, env=env)
+
+
+# --- clipboard ------------------------------------------------------------
+
+def split_range(query):
+    """`foo.rb:42-80` -> ("foo.rb", (42, 80)). A single line number is a location,
+    not a range, so `foo.rb:42` strips to ("foo.rb", None)."""
+    m = LINE_SUFFIX.search(query)
+    if not m:
+        return query, None
+    if not m.group(2):
+        return query[:m.start()], None
+    first, last = sorted((int(m.group(1)), int(m.group(2))))
+    return query[:m.start()], (first, last)
+
+
+def osc52(data):
+    if len(data) > COPY_MAX_BYTES:
+        raise ValueError(f"{len(data) // 1000} kB is over the "
+                         f"{COPY_MAX_BYTES // 1000} kB copy limit")
+    seq = b"\x1b]52;c;" + base64.b64encode(data) + b"\x07"
+    fd = os.open("/dev/tty", os.O_WRONLY)
+    try:
+        while seq:
+            seq = seq[os.write(fd, seq):]
+    finally:
+        os.close(fd)
+
+
+def copy_file(path, lines=None):
+    with open(path, "rb") as f:
+        data = f.read()
+    if b"\0" in data[:8192]:
+        raise ValueError("binary file")
+    if lines:
+        data = b"".join(data.splitlines(keepends=True)[lines[0] - 1:lines[1]])
+        if not data:
+            raise ValueError(f"no lines {lines[0]}-{lines[1]}")
+    osc52(data)
+    count = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
+    size = f"{len(data) / 1000:.1f} kB" if len(data) >= 1000 else f"{len(data)} B"
+    span = f" lines {lines[0]}-{lines[1]}" if lines else ""
+    noun = "line" if 1 == count else "lines"
+    return f"copied {os.path.basename(path)}{span} · {count} {noun} · {size}"
+
+
+def copy_path(path, lines=None):
+    text = path + (f":{lines[0]}-{lines[1]}" if lines else "")
+    osc52(text.encode())
+    return f"copied path {text}"
+
+
+def clean_paste(text):
+    line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    return line.strip().strip("`'\"")
+
+
+# --- picker ---------------------------------------------------------------
+
+def git_paths(cwd, *args):
+    out = subprocess.run(["git", "-C", cwd, "ls-files", "-z", *args],
+                         capture_output=True, check=True).stdout
+    return [p for p in out.decode(errors="replace").split("\0") if p]
+
+
+def list_files(cwd):
+    try:
+        paths = git_paths(cwd, "-co", "--exclude-standard")
+        # An ignored nested repo is invisible to the outer ls-files. Only a .git
+        # directory counts: a worktree's .git is a file, and its full checkout
+        # would swamp the list.
+        for ignored in git_paths(cwd, "-oi", "--exclude-standard", "--directory"):
+            nested = os.path.join(cwd, ignored)
+            if ignored.endswith("/") and os.path.isdir(os.path.join(nested, ".git")):
+                paths.extend(ignored + p for p in git_paths(nested, "-co", "--exclude-standard"))
+    except (OSError, subprocess.CalledProcessError):
+        paths = []
+        for root, dirs, names in os.walk(cwd):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and "node_modules" != d]
+            rel = os.path.relpath(root, cwd)
+            paths.extend(os.path.normpath(os.path.join(rel, n)) for n in names)
+            if len(paths) >= 50_000:
+                break
+    stamped = []
+    for p in paths:
+        try:
+            st = os.stat(os.path.join(cwd, p))
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            stamped.append((st.st_mtime, p))
+    stamped.sort(reverse=True)
+    return [p for _, p in stamped]
+
+
+def subsequence(term, hay):
+    it = iter(hay)
+    return all(c in it for c in term)
+
+
+def score(terms, hay):
+    base = hay[hay.rfind("/") + 1:]
+    total = 0
+    for term in terms:
+        if term in base:
+            continue
+        if term in hay:
+            total += 1
+        elif subsequence(term, base):
+            total += 2
+        elif subsequence(term, hay):
+            total += 3
+        else:
+            return None
+    return total
+
+
+def read_keys(fd):
+    data = os.read(fd, 1024).decode(errors="ignore")
+    keys, i = [], 0
+    while i < len(data):
+        ch = data[i]
+        if data.startswith(PASTE_START, i):
+            # A long paste can span reads; without its end marker the tail would
+            # arrive as keystrokes, and a newline in it as enter.
+            end = data.find(PASTE_END, i)
+            while end < 0 and select.select([fd], [], [], 0.5)[0]:
+                more = os.read(fd, 65536).decode(errors="ignore")
+                if not more:
+                    break
+                data += more
+                end = data.find(PASTE_END, i)
+            body_end = end if end >= 0 else len(data)
+            keys.append(("paste", data[i + len(PASTE_START):body_end]))
+            i = body_end + len(PASTE_END) if end >= 0 else len(data)
+            continue
+        if "\x1b" == ch:
+            seq = next((s for s in ESCAPES if data.startswith(s, i)), None)
+            if seq:
+                keys.append(ESCAPES[seq])
+                i += len(seq)
+                continue
+            if i + 1 < len(data) and data[i + 1] in "[O":
+                i += 2
+                while i < len(data) and not "@" <= data[i] <= "~":
+                    i += 1
+                i += 1
+                continue
+            keys.append("esc")
+        elif ch in CONTROLS:
+            keys.append(CONTROLS[ch])
+        elif ch.isprintable():
+            keys.append(ch)
+        i += 1
+    return keys
+
+
+class Picker:
+    def __init__(self, cwd, console, query="", selected="", mode="read"):
+        self.cwd = cwd
+        self.console = console
+        self.mode = mode
+        self.term = ""
+        self.lines = None
+        self.exact = None
+        self.status = None
+        self.copied = False
+        self.files = list_files(cwd)
+        self.query = ""
+        self.pool_query = ""
+        self.pool = self.files
+        self.matches = self.files
+        self.selected = 0
+        self.top = 0
+        self.previews = {}
+        self.resize = False
+        if query:
+            self.query = query
+            self.refilter()
+        if selected in self.matches:
+            self.selected = self.matches.index(selected)
+
+    def resolve(self, path):
+        return os.path.join(self.cwd, os.path.expanduser(path))
+
+    def path_mode(self):
+        return self.query.startswith(PATH_PREFIXES)
+
+    def browse(self):
+        head, slash, frag = self.term.rpartition("/")
+        if not slash:
+            head, frag = self.term, ""
+        try:
+            entries = list(os.scandir(self.resolve(head + "/")))
+        except OSError:
+            return []
+        fold = frag == frag.lower()
+        scored = []
+        for entry in entries:
+            if entry.name.startswith(".") and not frag.startswith("."):
+                continue
+            s = score([frag] if frag else [], entry.name.lower() if fold else entry.name)
+            if s is None:
+                continue
+            is_dir = entry.is_dir()
+            scored.append((s, not is_dir, entry.name.lower(),
+                           f"{head}/{entry.name}{'/' if is_dir else ''}"))
+        return [p for *_, p in sorted(scored)]
+
+    def refilter(self):
+        self.term, self.lines = split_range(self.query)
+        self.selected, self.top = 0, 0
+        if self.path_mode():
+            self.matches = self.browse()
+            self.pool, self.pool_query = self.files, ""
+        else:
+            # Extending the query can only narrow the match set, so the last pool is
+            # a valid starting point; the pool stays in mtime order for that reason.
+            base = self.pool if self.term.startswith(self.pool_query) else self.files
+            terms = self.term.split()
+            if not terms:
+                self.pool, self.matches = self.files, self.files
+            else:
+                fold = self.term == self.term.lower()
+                scored = [(s, p) for p in base
+                          if (s := score(terms, p.lower() if fold else p)) is not None]
+                self.pool = [p for _, p in scored]
+                self.matches = [p for _, p in sorted(scored, key=lambda sp: sp[0])]
+            self.pool_query = self.term
+        # A pasted path names one file exactly, and may be one ls-files never lists.
+        self.exact = self.term if os.path.isfile(self.resolve(self.term)) else None
+        if self.exact:
+            self.matches = [self.exact] + [p for p in self.matches if p != self.exact]
+
+    def copy(self, kind):
+        chosen = self.matches[self.selected]
+        full = os.path.abspath(self.resolve(chosen.rstrip("/")))
+        lines = self.lines if chosen == self.exact else None
+        try:
+            self.status = (copy_path if "copy-path" == kind else copy_file)(full, lines)
+        except OSError as err:
+            self.status = f"not copied: {err.strerror}"
+            return False
+        except ValueError as err:
+            self.status = f"not copied: {err}"
+            return False
+        return True
+
+    def handle(self, key):
+        self.status = None
+        if isinstance(key, tuple):
+            self.query += clean_paste(key[1])
+            self.refilter()
+            return None
+        if key in ("esc", "quit"):
+            return "quit"
+        if key in ("copy", "copy-path"):
+            if self.matches and self.copy(key) and "copy" == self.mode:
+                self.copied = True
+                return "quit"
+            return None
+        if "resize" == key and os.environ.get("HERDR_PLUGIN_ENTRYPOINT_ID"):
+            self.resize = True
+            return "quit"
+        if key in ("enter", "tab"):
+            if not self.matches:
+                return None
+            chosen = self.matches[self.selected]
+            if chosen.endswith("/") or ("tab" == key and self.path_mode()):
+                self.query = chosen
+                self.refilter()
+                return None
+            if "tab" == key:
+                return None
+            if "copy" == self.mode:
+                return self.handle("copy")
+            return "open"
+        if "up" == key:
+            self.selected = max(0, self.selected - 1)
+        elif "down" == key:
+            self.selected = min(len(self.matches) - 1, self.selected + 1)
+        elif key in ("pgup", "pgdn"):
+            step = max(1, self.console.size.height - 3)
+            delta = step if "pgdn" == key else -step
+            self.selected = max(0, min(len(self.matches) - 1, self.selected + delta))
+        elif key in ("backspace", "clear", "word"):
+            if "backspace" == key:
+                self.query = self.query[:-1]
+            elif "clear" == key:
+                self.query = ""
+            elif self.path_mode():
+                head = self.query.rstrip("/").rpartition("/")[0]
+                self.query = head + "/" if head else ""
+            else:
+                self.query = self.query.rstrip().rpartition(" ")[0]
+            self.refilter()
+        elif 1 == len(key):
+            self.query += key
+            self.refilter()
+        return None
+
+    def preview(self, path, width, height):
+        key = (path, width)
+        if key not in self.previews:
+            full = self.resolve(path)
+            if os.path.isdir(full):
+                try:
+                    names = sorted(e.name + ("/" if e.is_dir() else "") for e in os.scandir(full))
+                except OSError as err:
+                    names = [f"cannot list: {err.strerror}"]
+                self.previews[key] = names or ["(empty)"]
+            else:
+                self.previews[key] = render_lines(
+                    full, width, PREVIEW_BYTES,
+                    self.console.color_system or "standard", wrap=False)
+        lines = self.previews[key][:height]
+        return Text("\n").join(Text.from_ansi(line, no_wrap=True, overflow="crop")
+                               for line in lines)
+
+    def row(self, index, width):
+        path = self.matches[index]
+        if len(path) > width - 2:
+            path = "…" + path[-(width - 3):]
+        text = Text(("> " if index == self.selected else "  ") + path, no_wrap=True)
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        text.stylize("bold", text.plain.rfind(name))
+        if index == self.selected:
+            text.stylize("reverse")
+        return text
+
+    def draw(self):
+        width, height = self.console.size
+        list_w = max(24, min(60, width * 2 // 5))
+        body_h = max(3, height - 2)
+        if self.selected < self.top:
+            self.top = self.selected
+        elif self.selected >= self.top + body_h:
+            self.top = self.selected - body_h + 1
+        shown = range(self.top, min(len(self.matches), self.top + body_h))
+        rows = Text("\n").join(self.row(i, list_w) for i in shown) if shown else Text(
+            "  no matches", style="dim")
+        if self.matches:
+            path = self.matches[self.selected]
+            preview = Panel(self.preview(path, max(10, width - list_w - 4), body_h - 2),
+                            title=path, title_align="left", height=body_h,
+                            box=box.ROUNDED, border_style="dim")
+        else:
+            preview = Text("")
+        cwd = self.cwd.replace(os.path.expanduser("~"), "~", 1)
+        span = (f"  lines {self.lines[0]}-{self.lines[1]}"
+                if self.lines and self.exact else "")
+        header = Text.assemble(("❯ ", "bold cyan"), self.query, ("▏", "cyan"),
+                               (span, "yellow"),
+                               (f"  {len(self.matches)}" + (
+                                   "" if self.path_mode() else f"/{len(self.files)}"), "dim"),
+                               (f"   {cwd}", "dim"), no_wrap=True, overflow="ellipsis")
+        layout = Layout()
+        if self.status:
+            footer = Text(self.status, style="red" if self.status.startswith("not ")
+                          else "green", no_wrap=True, overflow="ellipsis")
+        else:
+            footer = COPY_FOOTER if "copy" == self.mode else FOOTER
+        layout.split_column(Layout(header, size=1), Layout(name="body"),
+                            Layout(footer, size=1))
+        layout["body"].split_row(Layout(rows, size=list_w), Layout(preview))
+        return layout
+
+    def run(self):
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            bracketed_paste(True)
+            with Live(get_renderable=self.draw, console=self.console, screen=True,
+                      auto_refresh=False, transient=True) as live:
+                live.refresh()
+                size = self.console.size
+                while True:
+                    if not select.select([fd], [], [], 0.25)[0]:
+                        if self.console.size != size:
+                            size = self.console.size
+                            live.refresh()
+                        continue
+                    for key in read_keys(fd):
+                        action = self.handle(key)
+                        if "quit" == action:
+                            return
+                        if "open" == action:
+                            live.stop()
+                            bracketed_paste(False)
+                            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                            page(self.resolve(self.matches[self.selected]), self.console)
+                            tty.setcbreak(fd)
+                            bracketed_paste(True)
+                            live.start()
+                            live.refresh()
+                    live.refresh()
+        finally:
+            bracketed_paste(False)
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def bracketed_paste(on):
+    sys.stdout.write("\x1b[?2004h" if on else "\x1b[?2004l")
+    sys.stdout.flush()
+
+
+def tui():
+    console = Console()
+    try:
+        if (target := os.environ.get("VIEWER_FILE")):
+            page(target, console)
+        else:
+            picker = Picker(os.environ.get("VIEWER_CWD") or os.getcwd(), console,
+                            os.environ.get("VIEWER_QUERY", ""),
+                            os.environ.get("VIEWER_SELECTED", ""),
+                            os.environ.get("VIEWER_MODE") or "read")
+            picker.run()
+            if picker.copied:
+                # popup.close kills the pane; give herdr time to read the OSC 52 off it.
+                time.sleep(0.2)
+            if picker.resize:
+                toggle_full()
+                selected = picker.matches[picker.selected] if picker.matches else ""
+                subprocess.Popen(
+                    [os.path.abspath(__file__), "reopen"],
+                    env={**os.environ, "VIEWER_CWD": picker.cwd,
+                         "VIEWER_QUERY": picker.query, "VIEWER_SELECTED": selected,
+                         "VIEWER_MODE": picker.mode},
+                    start_new_session=True, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if os.environ.get("HERDR_PLUGIN_ENTRYPOINT_ID"):
+            try:
+                herdr_call("popup.close", {})
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+
+def copy_command(args):
+    want_path = "--path" in args
+    args = [a for a in args if "--path" != a]
+    if not args:
+        launch({"VIEWER_CWD": focused_cwd(), "VIEWER_FILE": "", "VIEWER_MODE": "copy"})
+        return
+    name, lines = split_range(args[0])
+    full = os.path.abspath(os.path.expanduser(name))
+    try:
+        print((copy_path if want_path else copy_file)(full, lines), file=sys.stderr)
+    except (OSError, ValueError) as err:
+        sys.exit(f"view: {err}")
+
+
+def main(argv):
+    command, args = (argv[0], argv[1:]) if argv else ("", [])
+    if "popup" == command:
+        open_popup(args)
+    elif "tui" == command:
+        tui()
+    elif "reopen" == command:
+        reopen()
+    elif "copy" == command:
+        copy_command(args)
+    elif "show" == command and 1 == len(args):
+        page(os.path.abspath(args[0]), Console())
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,92 @@
+onboarding = false
+[ui]
+agent_panel_sort = "spaces"
+
+show_agent_labels_on_pane_borders = true
+[keys]
+# Caps Lock is the real prefix: a Ghostty-scoped Karabiner chord emits ctrl+b, so
+# this must stay pinned even though it matches the default.
+prefix = "ctrl+b"
+
+# ccnav-herdr — turn navigation. Failures toast; trail in
+# ~/.local/state/ccnav-herdr/nav.log.  Revert by deleting these blocks and
+# reloading (`herdr server reload-config`), not with `config reset-keys`.
+
+[[keys.command]]
+key = "prefix+u"           # previous turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav prev"
+
+[[keys.command]]
+key = "prefix+d"           # next turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav next"
+
+[[keys.command]]
+key = "prefix+f"           # newest turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav newest"
+
+[[keys.command]]
+key = "prefix+a"           # back to the live tail
+type = "shell"
+command = "~/.local/bin/herdr-compose nav bottom"
+
+[theme]
+name = "solarized"
+auto_switch = false
+
+[ui.toast]
+delivery = "off"
+
+# space-scope plugin — flip the Agents panel between this space and all spaces.
+# Revert by deleting this block and reloading (`herdr server reload-config`).
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "shell"
+command = "~/.local/bin/herdr-space-scope toggle"
+
+# herdr-dash plugin — floating dashboard: agents, memory by pane, notes,
+# prefix cheat-sheet, MEMORY.md index health. Popup is not reachable from the
+# CLI, so this shells out to a socket call. Revert by deleting this block and
+# reloading (`herdr server reload-config`), not with `config reset-keys`.
+
+[[keys.command]]
+key = "prefix+m"           # dashboard popup
+type = "shell"
+command = "~/.local/share/herdr-plugins/herdr-dash/run popup"
+
+# viewer plugin — floating file picker with Markdown/code preview over the
+# focused pane's cwd. Revert by deleting this block and reloading
+# (`herdr server reload-config`), not with `config reset-keys`.
+
+[[keys.command]]
+key = "prefix+shift+v"     # file viewer popup
+type = "shell"
+command = "~/.local/share/herdr-plugins/viewer/view popup"
+
+[[keys.command]]
+key = "prefix+y"           # file viewer in copy mode: enter copies contents
+type = "shell"
+command = "~/.local/share/herdr-plugins/viewer/view copy"
+
+# herdr-compose — nvim split under the agent for writing the next prompt;
+# <C-s> in nvim sends it. The ccnav bindings above go through `herdr-compose
+# nav` so they act on the agent while focus is in the compose pane. Revert by
+# deleting these blocks, restoring the ccnav commands, and reloading.
+
+[[keys.command]]
+key = "prefix+i"           # open/close compose split
+type = "shell"
+command = "~/.local/bin/herdr-compose toggle"
+
+[[keys.command]]
+key = "prefix+shift+k"     # scroll agent up half a page
+type = "shell"
+command = "~/.local/bin/herdr-compose scroll up"
+
+[[keys.command]]
+key = "prefix+shift+j"     # scroll agent down half a page
+type = "shell"
+command = "~/.local/bin/herdr-compose scroll down"

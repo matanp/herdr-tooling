@@ -1,0 +1,71 @@
+# herdr-sort rules -- FIRST MATCH WINS, and the order encodes the priority:
+#
+#   1. project rules   a project claims its work whatever the activity
+#   2. pr / docs / arch  fallbacks that only drain All / Dump
+#
+# Fit patterns against your own historical session titles rather than guessing.
+# Ticket numbers make poor patterns -- they rot within a cycle. Tag ticket work
+# explicitly instead.
+#
+#   tag        prefix you can type into a tab label ("api: retry budget") to force a
+#              destination; an explicit tag always outranks the title patterns
+#   workspace  destination label, created on first match
+#   title      case-insensitive regexes; matched against a copy with underscores
+#              split, so \bbilling\b still catches billing_webhooks
+#   cwd        case-insensitive regexes against the pane cwd
+#   only_from  workspaces this rule may pull a tab out of; a fallback without it
+#              drags PR-numbered tabs out of the project space they were opened in
+#   brief      injected into every new session in that workspace by the
+#              herdr-project-brief SessionStart hook, as the session's default
+#              subject. Opt-in: a rule without one injects nothing, and a
+#              workspace whose label no longer matches any rule goes quiet
+#              rather than asserting the wrong project. Must be an array of
+#              lines -- the parser rejects a triple-quoted string and exits,
+#              taking the sorter with it.
+#
+# Method words (subagents, runbook, worktree, memory) are deliberately absent: they
+# describe how the work is done, so they hijack whichever project is using them.
+#
+# Saved edits are picked up by a running daemon without a restart.
+
+protect = ["All / Dump"]
+
+[[rule]]
+tag = "api"
+workspace = "Public API"
+title = ["\\bapi\\b", "\\brate[- ]limit", "\\bwebhooks?\\b"]
+cwd = ["wt-api"]
+brief = ["Treat this session as Public API work unless the prompt names a different subject.",
+         "Scope and open questions: docs/api/GOALS.md -- read it first."]
+
+[[rule]]
+tag = "bill"
+workspace = "Billing"
+title = ["\\bbilling\\b", "\\binvoices?\\b", "\\bsubscriptions?\\b"]
+
+[[rule]]
+tag = "tool"
+workspace = "Misc / Tooling"
+title = ["\\bherdr\\b", "\\bccnav\\b", "\\btmux\\b", "claude code", "\\bcodex\\b",
+         "\\bskills?\\b", "\\bhooks?\\b", "\\bmcp\\b", "status ?line"]
+
+[[rule]]
+tag = "pr"
+only_from = ["All / Dump"]
+workspace = "PRs"
+title = ["pull request", "\\bPR ?#?\\d", "\\brebase\\b", "merge conflict",
+         "cherry[- ]pick", "resolve .{0,12}conflicts?"]
+
+[[rule]]
+tag = "docs"
+only_from = ["All / Dump"]
+workspace = "Docs"
+title = ["\\bdocumentation\\b", "\\bdocs\\b", "write[- ]?up", "\\breadme\\b", "\\badr\\b"]
+
+[[rule]]
+tag = "arch"
+only_from = ["All / Dump"]
+workspace = "Arch / Exploratory"
+title = ["\\barchitecture\\b", "\\breview\\b", "\\banalysis\\b", "\\binvestigat",
+         "\\bdeep[- ]dive\\b", "\\bspike\\b", "\\bexplor", "\\baudit\\b", "\\bdebug\\b",
+         "\\bresearch\\b"]

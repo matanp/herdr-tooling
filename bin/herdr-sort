@@ -1,0 +1,829 @@
+#!/usr/bin/env python3
+"""herdr-sort — route Herdr tabs into workspaces by their agent session title.
+
+usage: herdr-sort <command> [options]
+
+  plan                 show what would move, change nothing
+  once                 apply one sweep now
+  daemon               watch events and sort continuously
+  pin <target>         never touch this pane again (pane id or terminal id)
+  unpin <target>       resume managing it
+  status               daemon state, pins, last actions
+  rules                parse and validate the rules file
+
+  stale                KEEP / GLANCE / CLOSE for every open tab, with the reason
+  close --safe         close every CLOSE tab after one confirmation (--yes skips it)
+  close <pane|#>...    close these, whatever their verdict; pane ids or stale numbers
+  log [words]          closed sessions, newest first: summary, time, next step, id
+  log --all [words]    every session on the box, not only closed ones
+  reopen <id|#n|words> reopen a closed session in its old space
+  ledger [--summarize] re-index transcripts; --summarize fills Haiku summaries
+
+options:
+  --settle SECS        title must hold still this long (default 30; 0 for once/plan)
+  --max-moves N        cap moves per sweep (default 10)
+  --rules PATH         rules file (default ~/.config/herdr/sort-rules.toml)
+  --foreground         daemon: do not detach
+  --verbose            log skip reasons too
+  -n N                 log: rows to show (default 15)
+  --limit N            ledger --summarize: cap the Haiku calls
+"""
+
+import fcntl
+import json
+import datetime
+import os
+import re
+import socket
+import sys
+import threading
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/herdr-sort")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+LOCK_PATH = os.path.join(STATE_DIR, "daemon.lock")
+LOG_PATH = os.path.join(STATE_DIR, "sort.log")
+RULES_PATH = os.path.expanduser("~/.config/herdr/sort-rules.toml")
+sys.path.insert(0, os.path.expanduser("~/.local/share/herdr-plugins/herdr-sort"))
+import herdr_ledger as ledger  # noqa: E402
+
+EXPLICIT = re.compile(r"^\s*([A-Za-z][\w-]{0,15})\s*[:·]\s*(.+?)\s*$")
+AUTO_LABEL = re.compile(r"^\d+$")
+LABEL_MAX = 44
+
+
+class Herdr:
+    def __init__(self):
+        self.path = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
+            "~/.config/herdr/herdr.sock"
+        )
+
+    def _connect(self, timeout):
+        if not os.path.exists(self.path):
+            raise SystemExit(f"herdr-sort: no herdr server socket at {self.path}")
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(timeout)
+        conn.connect(self.path)
+        return conn
+
+    def call(self, method, params=None):
+        conn = self._connect(10)
+        try:
+            payload = {"id": "herdr-sort", "method": method, "params": params or {}}
+            conn.sendall(json.dumps(payload).encode() + b"\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            conn.close()
+        try:
+            response = json.loads(buf.split(b"\n", 1)[0])
+        except ValueError:
+            raise SystemExit(f"herdr-sort: unreadable response to {method}: {buf!r}")
+        if "error" in response:
+            err = response["error"]
+            raise HerdrError(f"{method}: {err.get('code')}: {err.get('message')}")
+        return response.get("result", {})
+
+    def events(self, types):
+        conn = self._connect(None)
+        subs = [{"type": t} for t in types]
+        payload = {"id": "herdr-sort", "method": "events.subscribe",
+                   "params": {"subscriptions": subs}}
+        conn.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    yield line
+
+
+class HerdrError(Exception):
+    pass
+
+
+def strip_comment(raw):
+    """A # inside a quoted pattern is not a comment -- \bPR ?#?\d is a real rule."""
+    out, quoted, escaped = [], False, False
+    for ch in raw:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif ch == "#" and not quoted:
+            break
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def parse_rules(path):
+    """Strict subset of TOML: top-level scalars/arrays plus [[rule]] tables.
+
+    Anything it cannot parse is an error with a line number — a rules file that
+    silently half-loads would route tabs to the wrong workspace.
+    """
+    if not os.path.exists(path):
+        raise SystemExit(f"herdr-sort: no rules file at {path} (run: herdr-sort rules --init)")
+    top, rules, table = {}, [], None
+    pending_key, pending_vals = None, None
+    with open(path, encoding="utf-8") as handle:
+        for lineno, raw in enumerate(handle, 1):
+            line = strip_comment(raw) if not pending_key else raw.strip()
+            if pending_key is not None:
+                closed = line.endswith("]")
+                for item in re.findall(r'"((?:[^"\\]|\\.)*)"', line):
+                    pending_vals.append(item.encode().decode("unicode_escape"))
+                if closed:
+                    (table if table is not None else top)[pending_key] = pending_vals
+                    pending_key, pending_vals = None, None
+                continue
+            if not line:
+                continue
+            if line == "[[rule]]":
+                table = {}
+                rules.append(table)
+                continue
+            if line.startswith("["):
+                raise SystemExit(f"herdr-sort: {path}:{lineno}: only [[rule]] tables are supported")
+            if "=" not in line:
+                raise SystemExit(f"herdr-sort: {path}:{lineno}: cannot parse {line!r}")
+            key, value = (part.strip() for part in line.split("=", 1))
+            target = table if table is not None else top
+            if value.startswith("["):
+                vals = [m.encode().decode("unicode_escape")
+                        for m in re.findall(r'"((?:[^"\\]|\\.)*)"', value)]
+                if value.endswith("]"):
+                    target[key] = vals
+                else:
+                    pending_key, pending_vals = key, vals
+                continue
+            m = re.match(r'^"((?:[^"\\]|\\.)*)"$', value)
+            if not m:
+                raise SystemExit(f"herdr-sort: {path}:{lineno}: value must be a string or array")
+            target[key] = m.group(1).encode().decode("unicode_escape")
+    compiled = []
+    for i, rule in enumerate(rules, 1):
+        for required in ("tag", "workspace"):
+            if required not in rule:
+                raise SystemExit(f"herdr-sort: {path}: rule {i} is missing {required!r}")
+        try:
+            compiled.append({
+                "tag": rule["tag"],
+                "workspace": rule["workspace"],
+                "title": [re.compile(p, re.I) for p in rule.get("title", [])],
+                "cwd": [re.compile(p, re.I) for p in rule.get("cwd", [])],
+                "only_from": [w.strip().lower() for w in rule.get("only_from", [])],
+            })
+        except re.error as err:
+            raise SystemExit(f"herdr-sort: {path}: rule {i} ({rule['tag']}): bad regex: {err}")
+    return {"protect": top.get("protect", []), "rules": compiled}
+
+
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {"pins": {}, "expected": {}, "labels": {}}
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=1, sort_keys=True)
+    os.replace(tmp, STATE_PATH)
+
+
+def log(message):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} {message}\n")
+
+
+GLYPHS = re.compile(r"^[\s\u2190-\u21ff\u2500-\u27bf\u2b00-\u2bff\u25a0-\u25ff\ufe0f\u2733]+")
+
+
+AGENT_SUFFIX = re.compile(r"\s*\|\s*[\w.-]+$")
+
+
+def normalize_title(text):
+    """terminal_title_stripped keeps the working-spinner glyph, which anchors miss,
+    and codex appends " | <repo>", which would eat a third of the tab label."""
+    return AGENT_SUFFIX.sub("", GLYPHS.sub("", text or "")).strip()
+
+
+def match_text(text):
+    """Underscores are word characters, so \bfoo\b misses foo_bar."""
+    return normalize_title(text).replace("_", " ")
+
+
+def shorten(text, limit=LABEL_MAX):
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def classify(pane, rules):
+    """(target_workspace, tag, rest, source) or None. Explicit tags outrank rules."""
+    label = pane.get("tab_label") or ""
+    m = EXPLICIT.match(label)
+    if m:
+        tag, rest = m.group(1).lower(), m.group(2)
+        for rule in rules["rules"]:
+            if rule["tag"].lower() == tag:
+                return rule["workspace"], rule["tag"], rest, "explicit"
+    probe = match_text(pane.get("terminal_title_stripped"))
+    display = normalize_title(pane.get("terminal_title_stripped"))
+    cwd = pane.get("cwd") or ""
+    here = (pane.get("workspace_label") or "").strip().lower()
+    for rule in rules["rules"]:
+        # A fallback rule only drains the inbox: a PR-numbered title carries no
+        # project word, so without this it would pull the tab out of its project.
+        if rule["only_from"] and here not in rule["only_from"]:
+            continue
+        if any(p.search(probe) for p in rule["title"]) or any(p.search(cwd) for p in rule["cwd"]):
+            return rule["workspace"], rule["tag"], display, "title"
+    return None
+
+
+def snapshot_view(herdr):
+    snap = herdr.call("session.snapshot")["snapshot"]
+    workspaces = {w["workspace_id"]: w for w in snap["workspaces"]}
+    tabs = {t["tab_id"]: t for t in snap["tabs"]}
+    panes_per_tab = {}
+    panes_per_ws = {}
+    for pane in snap["panes"]:
+        panes_per_tab[pane["tab_id"]] = panes_per_tab.get(pane["tab_id"], 0) + 1
+        panes_per_ws[pane["workspace_id"]] = panes_per_ws.get(pane["workspace_id"], 0) + 1
+    view = []
+    for pane in snap["panes"]:
+        tab = tabs.get(pane["tab_id"], {})
+        ws = workspaces.get(pane["workspace_id"], {})
+        item = dict(pane)
+        item["tab_label"] = tab.get("label", "")
+        item["workspace_label"] = ws.get("label", "")
+        item["tab_panes"] = panes_per_tab.get(pane["tab_id"], 1)
+        item["workspace_panes"] = panes_per_ws.get(pane["workspace_id"], 1)
+        item["focused"] = pane["pane_id"] == snap.get("focused_pane_id")
+        view.append(item)
+    by_label = {}
+    for ws in snap["workspaces"]:
+        by_label.setdefault(ws["label"].strip().lower(), ws)
+    return view, by_label
+
+
+def adopt_manual_moves(view, state):
+    """A pane that changed workspace without us is the user's placement: stop managing it."""
+    changed = False
+    for pane in view:
+        term = pane["terminal_id"]
+        expected = state["expected"].get(term)
+        current = pane["workspace_label"]
+        if expected is not None and expected != current and term not in state["pins"]:
+            state["pins"][term] = "manual"
+            log(f"pin {term} ({shorten(normalize_title(pane.get('terminal_title_stripped')), 30)}): "
+                f"moved by hand to {current!r}, expected {expected!r}")
+            changed = True
+    return changed
+
+
+def decide(view, rules, state, settle, titles_seen, now):
+    decisions = []
+    # Counted down as moves are decided: every pane in one sweep sees the same
+    # snapshot, so a static count lets a sweep move a space's last panes together.
+    remaining = {}
+    for pane in view:
+        remaining[pane["workspace_id"]] = pane["workspace_panes"]
+    for pane in view:
+        term = pane["terminal_id"]
+        title = normalize_title(pane.get("terminal_title_stripped"))
+        entry = titles_seen.get(term)
+        if entry is None or entry[0] != title:
+            titles_seen[term] = (title, now)
+            entry = titles_seen[term]
+        base = {
+            "pane_id": pane["pane_id"], "terminal_id": term, "title": title,
+            "tab_id": pane["tab_id"], "from": pane["workspace_label"],
+            "to": None, "tag": None, "label": None, "action": "skip", "reason": "",
+        }
+
+        if not pane.get("agent"):
+            base["reason"] = "no agent"
+            decisions.append(base)
+            continue
+        if term in state["pins"]:
+            base["reason"] = f"pinned ({state['pins'][term]})"
+            decisions.append(base)
+            continue
+
+        match = classify(pane, rules)
+        if not match:
+            base["reason"] = "no rule matched"
+            decisions.append(base)
+            continue
+        target_label, tag, rest, source = match
+        base.update({"to": target_label, "tag": tag, "source": source})
+
+        wanted_label = f"{tag} · {shorten(rest)}"
+        current_label = pane["tab_label"]
+        ours = state["labels"].get(term)
+        may_rename = (AUTO_LABEL.match(current_label) or current_label == ours
+                      or EXPLICIT.match(current_label))
+        base["label"] = wanted_label if (may_rename and current_label != wanted_label) else None
+
+        same_workspace = pane["workspace_label"].strip().lower() == target_label.strip().lower()
+        if same_workspace:
+            base["action"] = "rename" if base["label"] else "skip"
+            base["reason"] = "already in place"
+            decisions.append(base)
+            continue
+        if pane["focused"]:
+            base["reason"] = "focused; deferred"
+            decisions.append(base)
+            continue
+        if pane["tab_panes"] > 1:
+            base["reason"] = f"tab has {pane['tab_panes']} panes; move it by hand"
+            decisions.append(base)
+            continue
+        if source != "explicit" and settle and now - entry[1] < settle:
+            base["reason"] = f"title unsettled ({int(now - entry[1])}s of {settle}s)"
+            decisions.append(base)
+            continue
+        # Emptying a workspace closes it and renumbers the rest, so a protected
+        # workspace always keeps its last pane.
+        protected = pane["workspace_label"].strip().lower() in {
+            p.strip().lower() for p in rules["protect"]}
+        if protected and remaining[pane["workspace_id"]] <= 1:
+            base["reason"] = f"last pane in protected {pane['workspace_label']!r}"
+            decisions.append(base)
+            continue
+
+        remaining[pane["workspace_id"]] -= 1
+        base["action"] = "move"
+        base["reason"] = f"matched {tag} by {source}"
+        decisions.append(base)
+    return decisions
+
+
+def destination(by_label, workspace_label, tab_label):
+    """A missing workspace is created by the move itself.
+
+    workspace.create would seed the new workspace with an empty root tab that
+    nothing ever closes, so the first pane into a new workspace carries it.
+    """
+    existing = by_label.get(workspace_label.strip().lower())
+    if existing:
+        return {"type": "new_tab", "workspace_id": existing["workspace_id"],
+                "label": tab_label}
+    return {"type": "new_workspace", "label": workspace_label, "tab_label": tab_label}
+
+
+def apply(herdr, decisions, by_label, state, max_moves):
+    moves = 0
+    for decision in decisions:
+        if decision["action"] == "move":
+            if moves >= max_moves:
+                decision["reason"] = "move cap reached"
+                decision["action"] = "skip"
+                continue
+            label = decision["label"] or shorten(decision["title"])
+            dest = destination(by_label, decision["to"], label)
+            try:
+                result = herdr.call("pane.move", {
+                    "pane_id": decision["pane_id"],
+                    "destination": dest,
+                    "focus": False,
+                })
+            except HerdrError as err:
+                decision["action"] = "failed"
+                decision["reason"] = str(err)
+                log(f"FAILED move {decision['pane_id']} -> {decision['to']}: {err}")
+                continue
+            new_pane = result["move_result"]["pane"]
+            decision["pane_id"] = new_pane["pane_id"]
+            if dest["type"] == "new_workspace":
+                by_label[decision["to"].strip().lower()] = {
+                    "workspace_id": new_pane["workspace_id"]}
+                log(f"created workspace {decision['to']!r} ({new_pane['workspace_id']})")
+            state["expected"][decision["terminal_id"]] = decision["to"]
+            state["labels"][decision["terminal_id"]] = label
+            moves += 1
+            log(f"move {decision['terminal_id']} {decision['from']!r} -> {decision['to']!r} "
+                f"as {label!r} ({decision['reason']})")
+        elif decision["action"] == "rename":
+            try:
+                herdr.call("tab.rename", {"tab_id": decision["tab_id"], "label": decision["label"]})
+            except HerdrError as err:
+                decision["action"] = "failed"
+                decision["reason"] = str(err)
+                continue
+            state["labels"][decision["terminal_id"]] = decision["label"]
+            state["expected"].setdefault(decision["terminal_id"], decision["from"])
+            log(f"rename {decision['tab_id']} -> {decision['label']!r}")
+    return moves
+
+
+def sweep(herdr, rules, state, settle, titles_seen, dry_run, max_moves, verbose):
+    view, by_label = snapshot_view(herdr)
+    if adopt_manual_moves(view, state):
+        save_state(state)
+    decisions = decide(view, rules, state, settle, titles_seen, time.time())
+    if not dry_run:
+        apply(herdr, decisions, by_label, state, max_moves)
+        for pane in view:
+            term = pane["terminal_id"]
+            if term in state["expected"] and not any(
+                    d["terminal_id"] == term and d["action"] == "move" for d in decisions):
+                state["expected"][term] = pane["workspace_label"]
+        save_state(state)
+    return [d for d in decisions if verbose or d["action"] != "skip" or d["reason"] not in
+            ("no agent", "no rule matched", "already in place")], decisions
+
+
+def print_table(decisions, dry_run):
+    verb = {"move": "would move" if dry_run else "moved",
+            "rename": "would rename" if dry_run else "renamed",
+            "skip": "skip", "failed": "FAILED"}
+    if not decisions:
+        print("nothing to do")
+        return
+    width = max(len(d["title"][:38]) for d in decisions)
+    for d in sorted(decisions, key=lambda d: (d["action"] != "move", d["from"])):
+        title = (d["title"] or "(no title)")[:38]
+        arrow = f"{d['from']} -> {d['to']}" if d["action"] == "move" else d["from"]
+        print(f"  {verb[d['action']]:<11} {title:<{width}}  {arrow:<38} {d['reason']}")
+
+
+def daemon(herdr, args):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("herdr-sort: a daemon is already running")
+    lock.write(str(os.getpid()))
+    lock.flush()
+
+    wake = threading.Event()
+    types = ["tab.created", "tab.renamed", "tab.closed", "pane.created", "pane.updated",
+             "pane.moved", "pane.closed", "workspace.created", "workspace.renamed"]
+
+    def reader():
+        # The stream replays backlog on connect, so events are only a wake-up:
+        # every decision is recomputed from a fresh snapshot.
+        while True:
+            try:
+                for _ in herdr.events(types):
+                    wake.set()
+            except (OSError, SystemExit) as err:
+                log(f"event stream dropped ({err}); reconnecting in 5s")
+            time.sleep(5)
+
+    threading.Thread(target=reader, daemon=True).start()
+    log(f"daemon start pid={os.getpid()} settle={args['settle']}s socket={herdr.path}")
+    state = load_state()
+    titles_seen = {}
+    rules_stamp = os.path.getmtime(args["rules"])
+    rules = parse_rules(args["rules"])
+    while True:
+        wake.wait(timeout=10)
+        wake.clear()
+        time.sleep(1.5)
+        try:
+            stamp = os.path.getmtime(args["rules"])
+            if stamp != rules_stamp:
+                rules = parse_rules(args["rules"])
+                rules_stamp = stamp
+                log("rules reloaded")
+            sweep(herdr, rules, state, args["settle"], titles_seen, False,
+                  args["max_moves"], False)
+        except HerdrError as err:
+            log(f"sweep error: {err}")
+        except SystemExit as err:
+            log(f"fatal: {err}")
+            raise
+
+
+DEFAULT_RULES = '''# herdr-sort rules -- first match wins.
+#
+#   tag        prefix you can type into a tab label ("api: retry budget") to force a
+#              destination; an explicit tag always outranks the title patterns
+#   workspace  destination label, created on first match
+#   title      case-insensitive regexes against the agent session title
+#   cwd        case-insensitive regexes against the pane cwd
+#
+# Saved edits are picked up by a running daemon without a restart.
+
+protect = ["All / Dump"]
+
+[[rule]]
+tag = "api"
+workspace = "Public API"
+title = ["\\\\bapi\\\\b", "\\\\bwebhooks?\\\\b"]
+
+[[rule]]
+tag = "tool"
+workspace = "Tooling"
+title = ["\\\\bherdr\\\\b", "\\\\bccnav\\\\b", "\\\\btmux\\\\b"]
+
+[[rule]]
+tag = "docs"
+workspace = "Docs"
+title = ["\\\\bdocs?\\\\b", "\\\\breadme\\\\b"]
+'''
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    command = argv[1]
+    args = {"settle": 30, "max_moves": 10, "rules": RULES_PATH,
+            "foreground": False, "verbose": False}
+    rest = []
+    i = 2
+    while i < len(argv):
+        token = argv[i]
+        if token in ("--settle", "--max-moves", "--rules", "-n", "--limit"):
+            if i + 1 >= len(argv):
+                raise SystemExit(f"herdr-sort: {token} needs a value")
+            key = token.lstrip("-").replace("-", "_")
+            args[key] = argv[i + 1] if token == "--rules" else int(argv[i + 1])
+            i += 2
+            continue
+        if token in ("--foreground", "--verbose", "--init", "--safe", "--yes", "--all",
+                     "--summarize", "--json"):
+            args[token.lstrip("-")] = True
+            i += 1
+            continue
+        rest.append(token)
+        i += 1
+
+    if command == "rules":
+        if args.get("init"):
+            if os.path.exists(args["rules"]):
+                raise SystemExit(f"herdr-sort: {args['rules']} already exists")
+            with open(args["rules"], "w", encoding="utf-8") as handle:
+                handle.write(DEFAULT_RULES)
+            print(f"wrote {args['rules']}")
+        rules = parse_rules(args["rules"])
+        print(f"{args['rules']}: {len(rules['rules'])} rules, protect={rules['protect']}")
+        for rule in rules["rules"]:
+            print(f"  {rule['tag']:<6} -> {rule['workspace']:<22} "
+                  f"{len(rule['title'])} title, {len(rule['cwd'])} cwd patterns")
+        return 0
+
+    if command in LEDGER_COMMANDS:
+        return LEDGER_COMMANDS[command](args, rest)
+
+    herdr = Herdr()
+    state = load_state()
+
+    if command in ("pin", "unpin"):
+        if not rest:
+            raise SystemExit(f"herdr-sort: {command} needs a pane id or terminal id")
+        view, _ = snapshot_view(herdr)
+        for target in rest:
+            match = next((p for p in view if target in (p["pane_id"], p["terminal_id"])), None)
+            if not match:
+                raise SystemExit(f"herdr-sort: no pane {target!r}")
+            term = match["terminal_id"]
+            if command == "pin":
+                state["pins"][term] = "manual"
+            else:
+                state["pins"].pop(term, None)
+                state["expected"].pop(term, None)
+            print(f"{command} {match['pane_id']} ({term}) "
+                  f"{shorten(normalize_title(match.get('terminal_title_stripped')), 40)!r}")
+        save_state(state)
+        return 0
+
+    if command == "status":
+        running = "stopped"
+        if os.path.exists(LOCK_PATH):
+            probe = open(LOCK_PATH, "r+")
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except OSError:
+                running = f"running (pid {probe.read().strip()})"
+        print(f"daemon:  {running}")
+        print(f"socket:  {herdr.path}")
+        print(f"rules:   {args['rules']}")
+        print(f"pins:    {len(state['pins'])}")
+        for term, why in state["pins"].items():
+            print(f"           {term} ({why})")
+        if os.path.exists(LOG_PATH):
+            print("recent:")
+            with open(LOG_PATH, encoding="utf-8") as handle:
+                for line in handle.readlines()[-8:]:
+                    print("  " + line.rstrip())
+        return 0
+
+    rules = parse_rules(args["rules"])
+
+    if command in ("plan", "once"):
+        dry_run = command == "plan"
+        settle = args["settle"] if "--settle" in argv else 0
+        shown, _ = sweep(herdr, rules, state, settle, {}, dry_run,
+                         args["max_moves"], args["verbose"])
+        print_table(shown, dry_run)
+        return 0
+
+    if command == "daemon":
+        if not args["foreground"]:
+            if os.fork() > 0:
+                print(f"herdr-sort: daemon started (log: {LOG_PATH})")
+                return 0
+            os.setsid()
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+        daemon(herdr, args)
+        return 0
+
+    raise SystemExit(f"herdr-sort: unknown command {command!r} (try --help)")
+
+
+# --- ledger commands --------------------------------------------------------
+
+VERDICT_ORDER = ("CLOSE", "GLANCE", "KEEP")
+
+
+def _day(stamp):
+    return datetime.datetime.fromtimestamp(stamp).strftime("%m-%d") if stamp else "  ?  "
+
+
+def _stats(rec):
+    return (f"{_day(rec.get('start'))}\u2192{_day(rec.get('last'))} \u00b7 "
+            f"{ledger.human(rec.get('engaged_s'))} engaged \u00b7 "
+            f"{ledger.human(rec.get('agent_s'))} agent \u00b7 {rec.get('prompts', 0)} prompts")
+
+
+def _numbered_stale(rows):
+    order = {v: i for i, v in enumerate(VERDICT_ORDER)}
+    rows = sorted(rows, key=lambda r: (order[r["verdict"]], -(
+        (r.get("rec") or {}).get("last") and time.time() - r["rec"]["last"] or 0)))
+    for n, row in enumerate(rows, 1):
+        row["n"] = n
+    return rows
+
+
+def cmd_stale(args, rest):
+    rows, _ = ledger.assess()
+    rows = _numbered_stale(rows)
+    if args.get("json"):
+        print(json.dumps([{k: v for k, v in r.items() if k != "rec"} for r in rows], indent=1))
+        return 0
+    counts = {v: sum(r["verdict"] == v for r in rows) for v in VERDICT_ORDER}
+    print(" \u00b7 ".join(f"{counts[v]} {v}" for v in VERDICT_ORDER)
+          + "   (close --safe closes the CLOSE group; each is logged and reopenable)")
+    current = None
+    for row in rows:
+        if row["verdict"] != current:
+            current = row["verdict"]
+            print(f"\n{current}")
+        rec = row.get("rec") or {}
+        title = shorten(row["title"] or rec.get("title") or "(shell)", 46)
+        print(f" {row['n']:>3} {shorten(row['workspace'], 19):<19} {title:<46} {row['reason']}")
+        if rec.get("next_step") and row["verdict"] != "KEEP":
+            print(f"     {'':<19} {shorten(rec['next_step'], 90)}")
+    return 0
+
+
+def _confirm(prompt):
+    try:
+        return input(prompt).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_close(args, rest):
+    rows, index = ledger.assess()
+    rows = _numbered_stale(rows)
+    if args.get("safe"):
+        chosen = [r for r in rows if "CLOSE" == r["verdict"]]
+    elif rest:
+        chosen = []
+        for target in rest:
+            match = next((r for r in rows if target in (r["pane_id"], r["terminal_id"])
+                          or target.lstrip("#") == str(r["n"])), None)
+            if not match:
+                raise SystemExit(f"herdr-sort: no open tab {target!r} (numbers come from `stale`)")
+            chosen.append(match)
+    else:
+        raise SystemExit("herdr-sort: close needs --safe or pane ids / stale numbers")
+    if not chosen:
+        print("nothing to close")
+        return 0
+    for row in chosen:
+        print(f"  {shorten(row['workspace'], 19):<19} "
+              f"{shorten(row['title'] or '(shell)', 46):<46} {row['verdict']}")
+    if not args.get("yes") and not _confirm(f"close these {len(chosen)} tabs? [y/N] "):
+        print("nothing closed")
+        return 1
+    done = ledger.close(chosen, index)
+    for row in chosen:
+        if row.get("skipped"):
+            print(f"  kept {shorten(row['title'] or '(shell)', 46)}: {row['skipped']}")
+    log(f"closed {len(done)} tabs")
+    print(f"closed {len(done)}; `herdr-sort log` lists them, `herdr-sort reopen <n>` restores one")
+    return 0
+
+
+def cmd_log(args, rest):
+    index = ledger.load_index()
+    words = [w.lower() for w in rest]
+
+    # Whole words, prefix-matched: "oa" must not hit "dashboard", but "expan" still
+    # finds "expansion".
+    patterns = [re.compile(r"(?<![a-z0-9])" + re.escape(w)) for w in words]
+
+    def hit(*texts):
+        blob = " ".join(t or "" for t in texts).lower().replace("_", " ")
+        return all(p.search(blob) for p in patterns)
+
+    if args.get("all"):
+        index, _ = ledger.sync(index)
+        rows = sorted(index.values(), key=lambda r: -(r.get("last") or 0))
+        rows = [(None, r) for r in rows if r.get("prompts") and hit(
+            r.get("title"), r.get("first_ask"), r.get("recap"), r.get("summary"))]
+    else:
+        events = list(reversed(ledger.closes()))
+        rows = [(n, e) for n, e in enumerate(events, 1)]
+        rows = [(n, e) for n, e in rows if hit(
+            e.get("title"), e.get("workspace"),
+            *[(index.get(e.get("key") or "") or {}).get(k) for k in ("recap", "summary", "first_ask")])]
+    if not rows:
+        print("no sessions match" if words else
+              "nothing closed yet (try `herdr-sort log --all`)")
+        return 0
+    for n, item in rows[: args.get("n") or 15]:
+        rec = item if n is None else index.get(item.get("key") or "") or {}
+        title = (item.get("title") or rec.get("title") or rec.get("first_ask") or "(untitled)")
+        where = item.get("workspace") if n is not None else rec.get("agent")
+        head = f"#{n:<3}" if n is not None else "    "
+        closed = f"  closed {_day(item['closed_at'])}" if n is not None else ""
+        print(f"{head} {shorten(title, 58):<58} {shorten(where or '', 20)}{closed}")
+        if rec:
+            text, source = ledger.summary_of(rec)
+            print(f"     {_stats(rec)}")
+            print(f"     {shorten(text, 150)}" + ("" if "recap" == source else f"  [{source}]"))
+            if rec.get("next_step") and rec["next_step"] not in text:
+                print(f"     {shorten(rec['next_step'], 150)}")
+            print(f"     {rec.get('resume')}")
+        elif n is not None:
+            print(f"     shell in {item.get('cwd')}; scrollback {item.get('scrollback') or 'empty'}")
+    return 0
+
+
+def cmd_reopen(args, rest):
+    if not rest:
+        raise SystemExit("herdr-sort: reopen needs an id prefix, #n from `log`, or title words")
+    hits = ledger.find_closed(" ".join(rest))
+    if not hits:
+        raise SystemExit("herdr-sort: no closed session matches")
+    if len(hits) > 1:
+        print("several match; pick one by id:")
+        for e in hits[:10]:
+            print(f"  {(e.get('key') or ':').split(':', 1)[1][:8]}  {e.get('title')}")
+        return 1
+    pane, space = ledger.reopen(hits[0])
+    print(f"reopened {hits[0].get('title')!r} in {space!r} ({pane})")
+    return 0
+
+
+def cmd_ledger(args, rest):
+    index, parsed = ledger.sync()
+    print(f"indexed {len(index)} sessions ({parsed} re-parsed)")
+    if args.get("summarize"):
+        pending = sum(ledger.needs_summary(r) for r in index.values())
+        cap = args.get("limit") or pending
+        print(f"summarizing {min(cap, pending)} of {pending} with {ledger.SUMMARY_MODEL}")
+        done, failed = ledger.summarize(index, limit=args.get("limit"), progress=print)
+        print(f"summarized {done}, failed {failed}")
+    return 0
+
+
+LEDGER_COMMANDS = {"stale": cmd_stale, "close": cmd_close, "log": cmd_log,
+                   "reopen": cmd_reopen, "ledger": cmd_ledger}
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except HerdrError as err:
+        sys.exit(f"herdr-sort: {err}")
+    except KeyboardInterrupt:
+        sys.exit(130)

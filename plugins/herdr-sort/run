@@ -1,0 +1,12 @@
+#!/bin/sh
+# Plugin entry point: herdr runs plugin commands from the plugin root, and the
+# daemon must outlive the startup call that spawns it.
+set -eu
+bin="$HOME/.local/bin/herdr-sort"
+case "${1:-}" in
+  pause)
+    pid=$(cat "$HOME/.local/state/herdr-sort/daemon.lock" 2>/dev/null || true)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    ;;
+  *) exec "$bin" "$@" ;;
+esac

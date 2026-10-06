@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""herdr-dash -- one view of agents, memory, notes, prefixes and index health.
+
+usage: dash [command] [options]
+
+  tui              interactive pane (default; what both entrypoints run)
+  once             render the same view once to stdout, then exit
+  popup            open the popup pane over the socket and exit
+  close-popup      dismiss it
+
+options:
+  --sections a,b   which sections, in order (default all six)
+  --collapsed a,b  start these folded; z unfolds
+  --brief a,b      render these as a summary line only
+  --interval SECS  refresh floor (default 5)
+  --width N        once: render width (default: terminal width)
+  --size WxH       popup: outer size in cells or percent (default 86%x80%)
+
+Both entrypoints drive the same renderer. The popup is not reachable from the
+CLI -- `herdr plugin pane open --placement` offers no popup -- so `dash popup`
+calls plugin.pane.open over the socket, and the popup is dismissed with
+popup.close because it carries no pane id and never appears in `pane list`.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from dashlib import herdr as herdr_mod
+from dashlib import model as model_mod
+from dashlib import notes as notes_mod
+from dashlib import render
+
+PLUGIN_ID = "herdr-dash"
+ENTRYPOINT = "popup"   # the manifest pane whose placement is popup
+WAKE_EVENTS = ("pane.agent_status_changed", "pane.agent_detected",
+               "pane.created", "pane.closed", "workspace.focused")
+
+
+def _sections(text):
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = [name for name in names if name not in render.SECTIONS]
+    if unknown:
+        raise SystemExit(f"dash: unknown section(s): {', '.join(unknown)}")
+    return tuple(names)
+
+
+def _size(text):
+    width, _, height = text.partition("x")
+    if not width or not height:
+        raise SystemExit(f"dash: --size wants WxH, got {text!r}")
+    return [int(part) if part.isdigit() else part for part in (width, height)]
+
+
+# --- popup -----------------------------------------------------------------
+
+def open_popup(size):
+    width, height = size
+    result = herdr_mod.Herdr(PLUGIN_ID).call("plugin.pane.open", {
+        "plugin_id": PLUGIN_ID,
+        "entrypoint": ENTRYPOINT,
+        "placement": "popup",
+        "width": width,
+        "height": height,
+        "focus": True,
+    })
+    # The response is a bare ok with no pane id, so there is nothing to record.
+    print(json.dumps(result) if result else "ok")
+
+
+def close_popup():
+    herdr_mod.Herdr(PLUGIN_ID).call("popup.close", {})
+    print("ok")
+
+
+# --- refresh ---------------------------------------------------------------
+
+class Refresher:
+    """A collector thread with a timer floor, woken early by events.
+
+    One subscription was measured never firing, so an event may only
+    shorten the wait: every refresh recomputes from a fresh snapshot, and a
+    missed event costs latency rather than a wrong number.
+    """
+
+    def __init__(self, sections, interval):
+        self.sections = sections
+        self.interval = interval
+        self.model = {}
+        self.stamp = 0.0
+        self.error = None
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.stop = threading.Event()
+        self.generation = 0
+
+    def start(self):
+        threading.Thread(target=self._collect_loop, daemon=True).start()
+        threading.Thread(target=self._event_loop, daemon=True).start()
+
+    def _collect_loop(self):
+        while not self.stop.is_set():
+            try:
+                fresh, error = model_mod.collect(self.sections), None
+            except Exception as err:
+                fresh, error = None, f"{type(err).__name__}: {err}"
+            with self.lock:
+                if fresh is not None:
+                    self.model = fresh
+                    self.stamp = time.time()
+                self.error = error
+                self.generation += 1
+            self.wake.clear()
+            self.wake.wait(self.interval)
+
+    def _event_loop(self):
+        while not self.stop.is_set():
+            try:
+                for _ in herdr_mod.Herdr(PLUGIN_ID).events(WAKE_EVENTS):
+                    self.wake.set()
+                    if self.stop.is_set():
+                        return
+            except Exception:
+                pass
+            # The stream ends when the server restarts; back off, do not spin.
+            self.stop.wait(10)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.model), self.stamp, self.error, self.generation
+
+    def refresh_now(self):
+        self.wake.set()
+
+
+# --- curses ----------------------------------------------------------------
+
+STYLES = {}
+
+
+def _init_styles(curses):
+    curses.use_default_colors()
+    palette = {"head": (curses.COLOR_CYAN, curses.A_BOLD),
+               "sub": (curses.COLOR_BLUE, 0),
+               "ok": (curses.COLOR_GREEN, 0),
+               "warn": (curses.COLOR_YELLOW, 0),
+               "crit": (curses.COLOR_RED, curses.A_BOLD),
+               "dim": (-1, curses.A_DIM),
+               "normal": (-1, 0)}
+    for index, (name, (color, attr)) in enumerate(palette.items(), 1):
+        try:
+            curses.init_pair(index, color, -1)
+            STYLES[name] = curses.color_pair(index) | attr
+        except curses.error:
+            STYLES[name] = attr
+
+
+class Tui:
+    def __init__(self, stdscr, curses, refresher, order, collapsed=(), brief=()):
+        self.stdscr = stdscr
+        self.curses = curses
+        self.refresher = refresher
+        self.order = order
+        self.brief = tuple(brief)
+        self.collapsed = set(collapsed)
+        self.top = 0
+        self.cursor = 0
+        # draw() clamps top to the last full screen, so when everything fits,
+        # a digit jump cannot move top and z must target the jumped section.
+        self.section = None
+        self.lines = []
+        self.generation = -1
+        self.flash = ""
+        self.flash_until = 0.0
+
+    def say(self, message, seconds=4):
+        self.flash = message
+        self.flash_until = time.monotonic() + seconds
+
+    def rebuild(self, model):
+        height, width = self.stdscr.getmaxyx()
+        self.lines = render.build(model, max(40, width - 1), self.order,
+                                  self.collapsed, self.brief)
+        self.targets = [index for index, line in enumerate(self.lines)
+                        if line.target]
+        if self.cursor >= len(self.targets):
+            self.cursor = max(0, len(self.targets) - 1)
+
+    def cursor_line(self):
+        if not self.targets:
+            return None
+        return self.lines[self.targets[self.cursor]]
+
+    def follow_cursor(self, body):
+        if not self.targets:
+            return
+        index = self.targets[self.cursor]
+        if index < self.top:
+            self.top = index
+        elif index >= self.top + body:
+            self.top = index - body + 1
+
+    def draw(self, stamp, error):
+        height, width = self.stdscr.getmaxyx()
+        body = max(1, height - 1)
+        self.top = max(0, min(self.top, max(0, len(self.lines) - body)))
+        self.stdscr.erase()
+        focus = self.targets[self.cursor] if self.targets else -1
+        for row in range(body):
+            index = self.top + row
+            if index >= len(self.lines):
+                break
+            line = self.lines[index]
+            attr = STYLES.get(line.style, 0)
+            if index == focus:
+                attr |= self.curses.A_REVERSE
+            try:
+                self.stdscr.addnstr(row, 0, line.text.ljust(width - 1)
+                                    if index == focus else line.text,
+                                    width - 1, attr)
+            except self.curses.error:
+                pass
+        self._status(height - 1, width, stamp, error)
+        self.stdscr.refresh()
+
+    def _status(self, row, width, stamp, error):
+        if time.monotonic() < self.flash_until:
+            text = f" {self.flash}"
+            style = "warn"
+        elif error:
+            text = f" refresh failed: {error}"
+            style = "crit"
+        else:
+            age = int(time.time() - stamp) if stamp else -1
+            hints = [f"1-{len(self.order)} section", "z fold", "j/k move"]
+            if "agents" in self.order:
+                hints.append("enter focus pane")
+            hints += ["n note", "e editor", "r refresh", "q quit"]
+            text = (f" {time.strftime('%H:%M:%S', time.localtime(stamp))} "
+                    f"({age}s ago)  │  " + " · ".join(hints))
+            style = "dim"
+        try:
+            self.stdscr.addnstr(row, 0, text.ljust(width - 1), width - 1,
+                                STYLES.get(style, 0) | self.curses.A_REVERSE)
+        except self.curses.error:
+            pass
+
+    def prompt(self, label):
+        height, width = self.stdscr.getmaxyx()
+        buf = ""
+        self.curses.curs_set(1)
+        # The main loop leaves the window non-blocking; get_wch() would raise
+        # "no input" on the first idle tick instead of waiting for the typing.
+        self.stdscr.timeout(-1)
+        try:
+            while True:
+                text = f" {label}{buf}"
+                try:
+                    self.stdscr.addnstr(height - 1, 0, text.ljust(width - 1),
+                                        width - 1, self.curses.A_REVERSE)
+                    self.stdscr.move(height - 1,
+                                     min(width - 2, len(text)))
+                except self.curses.error:
+                    pass
+                self.stdscr.refresh()
+                try:
+                    key = self.stdscr.get_wch()
+                except self.curses.error:
+                    continue
+                if key in ("\n", "\r", self.curses.KEY_ENTER):
+                    return buf
+                if key == "\x1b":
+                    return None
+                if key in ("\x7f", "\b", self.curses.KEY_BACKSPACE):
+                    buf = buf[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    buf += key
+        finally:
+            self.curses.curs_set(0)
+            self.stdscr.timeout(250)
+
+    def editor(self):
+        command = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+        path = notes_mod.path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            notes_mod.write(notes_mod.read())
+        self.curses.endwin()
+        subprocess.call([*command.split(), path])
+        self.stdscr.clear()
+        self.curses.doupdate()
+        self.refresher.refresh_now()
+
+    def focus_pane(self, pane_id):
+        try:
+            herdr_mod.Herdr(PLUGIN_ID).call("pane.focus", {"pane_id": pane_id})
+            return True
+        except Exception as err:
+            self.say(str(err))
+            return False
+
+    def handle(self, key, body):
+        curses = self.curses
+        if key in (ord("q"), ord("Q"), 27):
+            return False
+        if key not in (ord("z"),) and not ord("1") <= key <= ord("9"):
+            self.section = None
+        if key in (ord("j"), curses.KEY_DOWN):
+            if self.targets:
+                self.cursor = min(len(self.targets) - 1, self.cursor + 1)
+                self.follow_cursor(body)
+        elif key in (ord("k"), curses.KEY_UP):
+            if self.targets:
+                self.cursor = max(0, self.cursor - 1)
+                self.follow_cursor(body)
+        elif key in (curses.KEY_NPAGE, 4):
+            self.top += body
+        elif key in (curses.KEY_PPAGE, 21):
+            self.top -= body
+        elif key == ord("g"):
+            self.top = 0
+            self.cursor = 0
+        elif key == ord("G"):
+            self.cursor = max(0, len(self.targets) - 1)
+            self.top = len(self.lines)
+            self.follow_cursor(body)
+        elif key == ord("r"):
+            self.refresher.refresh_now()
+            self.say("refreshing")
+        elif ord("1") <= key <= ord("9"):
+            position = key - ord("1")
+            if position < len(self.order):
+                name = self.order[position]
+                self.section = name
+                self.say(f"{render.TITLES[name]}: z folds/unfolds")
+                for index, line in enumerate(self.lines):
+                    if line.section == name:
+                        self.top = index
+                        break
+        elif key == ord("z"):
+            name = self.section or (
+                self.lines[min(self.top, len(self.lines) - 1)].section
+                if self.lines else None)
+            if name:
+                self.collapsed ^= {name}
+                self.generation = -1
+        elif key in (ord("\n"), ord("\r"), curses.KEY_ENTER, 10, 13):
+            line = self.cursor_line()
+            if line and "agent" == line.target[0]:
+                pane = line.target[1].get("pane")
+                if pane and self.focus_pane(pane):
+                    return False
+        elif key in (ord("n"), ord("N")):
+            attach = key == ord("N")
+            target = notes_mod.GLOBAL
+            if attach:
+                line = self.cursor_line()
+                if not line or "agent" != line.target[0]:
+                    self.say("N attaches to an agent row; move the cursor there")
+                    return True
+                target = line.target[1].get("terminal_id")
+                if not target:
+                    self.say("that row has no terminal_id to key on")
+                    return True
+            text = self.prompt("note> ")
+            if text:
+                notes_mod.add(text, target)
+                self.refresher.refresh_now()
+                self.say("note saved")
+        elif key == ord("d"):
+            line = self.cursor_line()
+            if line and "note" == line.target[0]:
+                _, section, position = line.target
+                notes_mod.remove(section, position)
+                self.refresher.refresh_now()
+                self.say("note deleted")
+            else:
+                self.say("d deletes a note; move the cursor to one")
+        elif key == ord("e"):
+            self.editor()
+        return True
+
+    def run(self):
+        self.stdscr.timeout(250)
+        while True:
+            model, stamp, error, generation = self.refresher.snapshot()
+            height, _ = self.stdscr.getmaxyx()
+            body = max(1, height - 1)
+            if generation != self.generation:
+                self.generation = generation
+                self.rebuild(model)
+            self.draw(stamp, error)
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                return
+            if -1 == key:
+                continue
+            if self.curses.KEY_RESIZE == key:
+                self.generation = -1
+                continue
+            if not self.handle(key, body):
+                return
+
+
+def tui(order, interval, collapsed=(), brief=()):
+    import curses
+
+    refresher = Refresher(order, interval)
+    refresher.start()
+    # Without this the pane is blank until the first collect returns.
+    deadline = time.monotonic() + 5
+    while not refresher.snapshot()[1] and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    def main(stdscr):
+        curses.curs_set(0)
+        _init_styles(curses)
+        Tui(stdscr, curses, refresher, order, collapsed, brief).run()
+
+    try:
+        curses.wrapper(main)
+    finally:
+        refresher.stop.set()
+        refresher.wake.set()
+
+
+def once(order, width, brief=()):
+    if not width:
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 100
+    print(render.plain(model_mod.collect(order), max(40, width - 1), order,
+                       brief))
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("command", nargs="?", default="tui")
+    parser.add_argument("--sections", type=_sections, default=render.SECTIONS)
+    parser.add_argument("--collapsed", type=_sections, default=())
+    parser.add_argument("--brief", type=_sections, default=())
+    parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--width", type=int, default=0)
+    parser.add_argument("--size", type=_size, default=["86%", "80%"])
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args(argv[1:])
+    if args.help:
+        print(__doc__.strip())
+        return 0
+    try:
+        if "tui" == args.command:
+            tui(tuple(args.sections), args.interval, set(args.collapsed),
+                tuple(args.brief))
+        elif "once" == args.command:
+            once(tuple(args.sections), args.width, tuple(args.brief))
+        elif "popup" == args.command:
+            open_popup(args.size)
+        elif "close-popup" == args.command:
+            close_popup()
+        else:
+            sys.exit(f"dash: unknown command {args.command!r}")
+    except herdr_mod.HerdrError as err:
+        sys.exit(f"dash: {err}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

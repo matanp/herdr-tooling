@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""ccnav on Herdr — v0 prototype.
+
+Turn navigation for a Claude Code pane hosted by Herdr, built on this recipe:
+
+  * the viewport is moved by `herdr terminal session control` with a single
+    `terminal.scroll` command on stdin.  Never `--takeover` (it evicts the
+    attached client); always the pane's own --cols/--rows (anything else
+    resizes the pane and reflows Claude Code's output).
+  * the 1000-row `pane read` clamp is defeated by scrolling and re-reading
+    `--source visible`, which tracks the scroll offset.  So a turn list is a
+    bounded sweep, not a forward-accumulating store.
+  * the append-invariant coordinate is `max_offset_from_bottom -
+    offset_from_bottom` ("top index": 0 == oldest line Herdr still holds).
+    A raw offset_from_bottom decays at the rate output arrives; the invariant
+    survives append but NOT eviction, so every stored position carries its
+    turn text and is re-anchored by text on use.
+
+The sweep moves the user's viewport and every window pushes a repaint, so it
+is done once and cached; navigation itself is a single scroll.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/ccnav-herdr")
+
+# U+276F + ASCII space == a submitted turn.  U+276F + NBSP is the live
+# composer (text not yet sent) and must never be treated as a turn.
+TURN_RE = re.compile("^\u276f\u0020")      # submitted turn
+COMPOSER_RE = re.compile("^\u276f\u00a0")  # live composer, NOT a turn
+
+WINDOW_OVERLAP = 3          # rows of overlap between sweep windows
+SCROLL_CMD_TYPE = "terminal.scroll"
+
+
+class Fail(Exception):
+    """Anything that should stop the tool with a message, not a traceback."""
+
+
+class Refused(Fail):
+    """Herdr refused terminal control because a client is directly attached."""
+
+
+# ---------------------------------------------------------------- herdr CLI
+
+HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+
+
+def herdr(*args, stdin=None, timeout=20):
+    return subprocess.run(
+        [HERDR_BIN, *args], input=stdin, capture_output=True, text=True,
+        timeout=timeout,
+    )
+
+
+def api(*args):
+    p = herdr(*args)
+    d = None
+    # Failures come back as JSON on stderr, successes as JSON on stdout.
+    for stream in (p.stdout, p.stderr):
+        if not stream or not stream.strip():
+            continue
+        try:
+            d = json.loads(stream)
+            break
+        except json.JSONDecodeError:
+            continue
+    if d is None:
+        raise Fail("herdr %s: unparseable output: %s"
+                   % (" ".join(args), (p.stdout or p.stderr).strip()[:200]))
+    if "error" in d:
+        err = d["error"]
+        raise Fail("herdr %s: %s" % (" ".join(args),
+                                     err.get("message") or json.dumps(err)[:200]))
+    return d.get("result", {})
+
+
+def pane_info(pane):
+    return api("pane", "get", pane)["pane"]
+
+
+def focused_pane():
+    snap = api("api", "snapshot")["snapshot"]
+    pane = snap.get("focused_pane_id")
+    if not pane:
+        raise Fail("no focused pane in the Herdr snapshot")
+    return pane
+
+
+def read_visible(pane, rows=None):
+    p = herdr("pane", "read", pane, "--source", "visible", "--format", "text")
+    if p.returncode != 0:
+        raise Fail("pane read failed: %s" % (p.stderr or p.stdout).strip()[:200])
+    out = [ln.rstrip() for ln in p.stdout.split("\n")]
+    # The output ends in a newline, so the split leaves one phantom row.  Left
+    # in, it writes a blank at the far edge of every sweep window that the next
+    # window never overwrites (measured: one blank row every `step` lines).
+    if out and out[-1] == "":
+        out.pop()
+    return out[:rows] if rows else out
+
+
+# ------------------------------------------------------- geometry (cols/rows)
+# Herdr's API carries viewport_rows but NO column count, so the pane's own pty
+# is the source of truth: HERDR_PANE_ID is in every pane process's environ, and
+# fd 0 of that process is the pty.
+
+def pty_geometry(pane):
+    want = ("HERDR_PANE_ID=%s" % pane).encode()
+    # Pane ids are session-scoped, not machine-unique: two Herdr sessions on
+    # one box both start at w1:p1.  When we know our own server socket, require
+    # the candidate process to carry the same one.
+    sock = os.environ.get("HERDR_SOCKET_PATH")
+    want_sock = ("HERDR_SOCKET_PATH=%s" % sock).encode() if sock else None
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/environ" % entry, "rb") as fh:
+                env = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if want in env and (want_sock is None or want_sock in env):
+            pids.append(int(entry))
+    for pid in sorted(pids):              # lowest pid == longest-lived
+        try:
+            tty = os.readlink("/proc/%d/fd/0" % pid)
+        except OSError:
+            continue
+        if not tty.startswith("/dev/pts/"):
+            continue
+        try:
+            with open(tty) as fh:
+                rows, cols, _, _ = struct.unpack(
+                    "HHHH", fcntl.ioctl(fh, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            continue
+        if rows and cols:
+            return cols, rows
+    return None, None
+
+
+def geometry(pane, info):
+    """Exact (cols, rows) or refuse.  Guessing cols would resize the pane."""
+    cols, rows = pty_geometry(pane)
+    if cols is None:
+        raise Fail("cannot determine the pane's column count (no readable pty "
+                   "for %s); refusing to scroll, since wrong --cols resizes "
+                   "the pane and reflows its output" % pane)
+    api_rows = info["scroll"].get("viewport_rows")
+    if api_rows and rows != api_rows:
+        rows = api_rows                   # trust Herdr's own view of the pane
+    return cols, rows
+
+
+# ------------------------------------------------------------------ scrolling
+
+def scroll(pane, direction, lines, cols, rows):
+    if lines <= 0:
+        return
+    cmd = {"type": SCROLL_CMD_TYPE, "direction": direction, "lines": int(lines),
+           "source": "wheel", "column": 0, "row": 0, "modifiers": 0}
+    p = herdr("terminal", "session", "control", pane,
+              "--cols", str(cols), "--rows", str(rows),
+              stdin=json.dumps(cmd) + "\n")
+    blob = (p.stdout or "") + (p.stderr or "")
+    if "already has an attached client" in blob:
+        raise Refused(
+            "pane %s has a direct `herdr terminal attach` client; refusing to "
+            "escalate with --takeover (it would evict that client)" % pane)
+    if p.returncode != 0:
+        raise Fail("terminal control failed: %s" % blob.strip()[:200])
+
+
+def scroll_to_offset(pane, target, cols, rows):
+    cur = pane_info(pane)["scroll"]
+    target = max(0, min(int(target), cur["max_offset_from_bottom"]))
+    delta = target - cur["offset_from_bottom"]
+    if delta > 0:
+        scroll(pane, "up", delta, cols, rows)
+    elif delta < 0:
+        scroll(pane, "down", -delta, cols, rows)
+    return target
+
+
+# --------------------------------------------------------------------- sweep
+
+TAIL_REFRESH_MAX = 4000     # beyond this much growth, just re-sweep everything
+
+
+def sweep(pane, verbose=False, dump=None, floor=0, merge=None):
+    """Read the whole scrollback by scrolling, and return the turn list.
+
+    Relative scrolls are invariant-preserving: if output arrives mid-sweep the
+    server re-bases the held view (offset and max rise together), so the top
+    index moves by exactly the number of lines scrolled.  One `pane get` at the
+    start is therefore enough to know where we are; one at the end tells us
+    whether the scrollback was evicted under us.
+    """
+    info = pane_info(pane)
+    cols, rows = geometry(pane, info)
+    start = info["scroll"]
+    was_at_bottom = start["offset_from_bottom"] == 0
+    keep_top_index = (start["max_offset_from_bottom"]
+                      - start["offset_from_bottom"])
+
+    step = max(1, rows - WINDOW_OVERLAP)
+    lines = {}
+    t0 = time.time()
+    windows = 0
+    try:
+        scroll_to_offset(pane, 0, cols, rows)
+        here = pane_info(pane)["scroll"]
+        max_at_sweep = here["max_offset_from_bottom"]
+        top_index = max_at_sweep - here["offset_from_bottom"]
+        while True:
+            for row, text in enumerate(read_visible(pane, rows)):
+                lines[top_index + row] = text
+            windows += 1
+            if top_index <= floor:
+                break
+            move = min(step, top_index - floor)
+            scroll(pane, "up", move, cols, rows)
+            top_index -= move
+    finally:
+        end = pane_info(pane)["scroll"]
+        if was_at_bottom:
+            scroll_to_offset(pane, 0, cols, rows)
+        else:
+            scroll_to_offset(pane, end["max_offset_from_bottom"] - keep_top_index,
+                             cols, rows)
+
+    grew = end["max_offset_from_bottom"] - max_at_sweep
+    turns = [{"index": i, "text": lines[i]}
+             for i in sorted(lines) if TURN_RE.match(lines[i])]
+    if merge:
+        # A tail refresh only re-read from `floor` up, so keep everything the
+        # earlier sweep found below it.  Same index space, so index+text is a
+        # sound key.
+        seen = {(t["index"], t["text"]) for t in turns}
+        turns = sorted([t for t in merge if (t["index"], t["text"]) not in seen
+                        and t["index"] < floor] + turns,
+                       key=lambda t: t["index"])
+    state = {
+        "pane": pane,
+        "swept_at": time.time(),
+        "max_at_sweep": max_at_sweep,
+        "rows_read": len(lines),
+        "windows": windows,
+        "seconds": round(time.time() - t0, 2),
+        "turns": turns,
+    }
+    if dump:
+        with open(dump, "w") as fh:
+            for i in sorted(lines):
+                fh.write("%d\t%s\n" % (i, lines[i]))
+    if verbose:
+        print("swept %d windows, %d rows, %d turns in %.1fs%s%s"
+              % (windows, len(lines), len(turns), state["seconds"],
+                 "" if not floor else " (tail only, from index %d)" % floor,
+                 "" if not grew else
+                 " (scrollback grew by %d rows mid-sweep)" % grew),
+              file=sys.stderr)
+    save_state(state)
+    return state
+
+
+# --------------------------------------------------------------------- state
+
+def acquire_lock(pane, wait=5.0):
+    """Serialize navigation per pane.
+
+    Two keypresses in flight both read the current offset before either has
+    scrolled, so the second one recomputes from a stale position and a step is
+    silently lost (measured: three rapid presses stepped 3 -> 3 -> 2).  Wait for
+    the lock rather than failing: a keypress should queue, not disappear.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fh = open(os.path.join(STATE_DIR, "%s.lock" % pane.replace(":", "_")), "w")
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.time() >= deadline:
+                raise Fail("another ccnav-herdr is still working on %s" % pane)
+            time.sleep(0.05)
+
+
+def journal(text):
+    """Append an outcome line.  A shell-type keybinding has no terminal, so
+    this file is the only trail of what a keypress actually did."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "nav.log"), "a") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except OSError:
+        pass
+
+
+def notify(title, body=""):
+    """Toast, for the same reason: a keypress that failed must be visible."""
+    args = ["notification", "show", title]
+    if body:
+        args += ["--body", body]
+    try:
+        herdr(*args, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def state_path(pane):
+    return os.path.join(STATE_DIR, "%s.json" % pane.replace(":", "_"))
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = state_path(state["pane"]) + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=1)
+    os.replace(tmp, state_path(state["pane"]))
+
+
+def load_state(pane, refresh=False, verbose=False):
+    """Cached turn list, brought up to date cheaply.
+
+    New turns can only appear at the tail, so growth since the last sweep is
+    re-read on its own instead of re-reading the whole scrollback.  A shrunken
+    scrollback (cleared, or evicted at saturation) invalidates the index space,
+    so that falls back to a full sweep.
+    """
+    cached = None
+    if not refresh:
+        try:
+            with open(state_path(pane)) as fh:
+                cached = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            cached = None
+    if cached:
+        max_now = pane_info(pane)["scroll"]["max_offset_from_bottom"]
+        grew = max_now - cached.get("max_at_sweep", 0)
+        if grew <= 0:
+            return cached
+        if grew <= TAIL_REFRESH_MAX:
+            floor = max(0, cached["max_at_sweep"] - WINDOW_OVERLAP)
+            return sweep(pane, verbose=verbose, floor=floor,
+                         merge=cached["turns"])
+    return sweep(pane, verbose=verbose)
+
+
+# ---------------------------------------------------------------- navigation
+
+def top_index_now(info):
+    s = info["scroll"]
+    return s["max_offset_from_bottom"] - s["offset_from_bottom"]
+
+
+def resolve(pane, turn, cols, rows):
+    """Put `turn` at the top of the viewport, re-anchoring by text.
+
+    The stored index survives append but not eviction, so it is a hint: land on
+    it, then confirm the recorded text is at row 0 and correct by the row delta
+    if the window has shifted.  A turn whose text is not in the landing window
+    is reported unresolvable rather than silently mis-navigated.
+    """
+    info = pane_info(pane)
+    max_now = info["scroll"]["max_offset_from_bottom"]
+    target = max_now - turn["index"]
+    if target < 0:
+        raise Fail("turn is below the newest window (index %d, max %d) — "
+                   "re-sweep" % (turn["index"], max_now))
+    scroll_to_offset(pane, target, cols, rows)
+    window = read_visible(pane)
+    if window and window[0] == turn["text"]:
+        return 0
+    for row, text in enumerate(window):
+        if text == turn["text"]:
+            # The line sits `row` rows below the top, so the viewport has to
+            # move that many rows toward the tail: "down", not "up".
+            scroll(pane, "down", row, cols, rows)
+            after = read_visible(pane)
+            if after and after[0] == turn["text"]:
+                return row
+            break
+    raise Fail("could not re-anchor %r in the landing window — the line was "
+               "probably evicted; re-sweep (`ccnav-herdr sweep`)"
+               % turn["text"][:60])
+
+
+def pick(turns, cur, which, n=None):
+    if not turns:
+        raise Fail("no turns recorded for this pane — try `sweep`")
+    if which == "seek":
+        if n is None or not (1 <= n <= len(turns)):
+            raise Fail("seek takes 1..%d" % len(turns))
+        return turns[n - 1]
+    if which == "newest":
+        return turns[-1]
+    if which == "oldest":
+        return turns[0]
+    if which == "prev":
+        earlier = [t for t in turns if t["index"] < cur]
+        if not earlier:
+            raise Fail("already at the oldest recorded turn")
+        return earlier[-1]
+    if which == "next":
+        later = [t for t in turns if t["index"] > cur]
+        if not later:
+            raise Fail("already at the newest recorded turn")
+        return later[0]
+    raise Fail("unknown move %r" % which)
+
+
+# ----------------------------------------------------------------------- main
+
+def cmd_list(args, pane):
+    state = load_state(pane, refresh=args.refresh, verbose=True)
+    cur = top_index_now(pane_info(pane))
+    if args.json:
+        print(json.dumps(state, indent=1))
+        return
+    if not state["turns"]:
+        print("no turns found in %s" % pane)
+        return
+    width = max(20, (os.get_terminal_size().columns if sys.stdout.isatty()
+                     else 100) - 18)
+    at = max([t["index"] for t in state["turns"] if t["index"] <= cur],
+             default=None)
+    for i, t in enumerate(state["turns"], 1):
+        here = "→" if t["index"] == at else " "
+        text = t["text"][2:].strip() or "(empty)"
+        print("%s %3d  %6d  %s" % (here, i, t["index"], text[:width]))
+    print("\n%d turns · swept %s ago · viewport top index %d"
+          % (len(state["turns"]),
+             human(time.time() - state["swept_at"]), cur), file=sys.stderr)
+
+
+def human(seconds):
+    if seconds < 90:
+        return "%ds" % seconds
+    if seconds < 5400:
+        return "%dm" % (seconds / 60)
+    return "%dh" % (seconds / 3600)
+
+
+def cmd_move(args, pane, which):
+    state = load_state(pane, refresh=args.refresh, verbose=True)
+    info = pane_info(pane)
+    cols, rows = geometry(pane, info)
+    turn = pick(state["turns"], top_index_now(info), which,
+                getattr(args, "n", None))
+    shift = resolve(pane, turn, cols, rows)
+    msg = "→ %s%s" % (turn["text"][2:].strip()[:70],
+                      "" if not shift else "  (re-anchored %+d rows)" % shift)
+    print(msg)
+    journal("%s %s %s" % (pane, which, msg))
+
+
+def cmd_bottom(args, pane):
+    info = pane_info(pane)
+    cols, rows = geometry(pane, info)
+    scroll_to_offset(pane, 0, cols, rows)
+    print("→ bottom")
+    journal("%s bottom" % pane)
+
+
+def cmd_where(args, pane):
+    info = pane_info(pane)
+    s = info["scroll"]
+    cols, rows = pty_geometry(pane)
+    print(json.dumps({
+        "pane": pane, "agent": info.get("agent"),
+        "title": info.get("terminal_title_stripped"),
+        "offset_from_bottom": s["offset_from_bottom"],
+        "max_offset_from_bottom": s["max_offset_from_bottom"],
+        "top_index": top_index_now(info),
+        "viewport_rows": s.get("viewport_rows"),
+        "pty_cols": cols, "pty_rows": rows,
+    }, indent=1))
+
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--pane",
+                        help="target pane id (default: Herdr's focused pane)")
+    common.add_argument("--refresh", action="store_true",
+                        help="re-sweep before acting")
+    common.add_argument("--json", action="store_true")
+    # The shared flags live on the subparsers only: adding them to the parent
+    # too lets an unset subparser default clobber a pre-subcommand value.
+    ap = argparse.ArgumentParser(
+        prog="ccnav-herdr", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", parents=[common], help="list the recorded turns")
+    sweeper = sub.add_parser("sweep", parents=[common],
+                             help="re-read the whole scrollback")
+    sweeper.add_argument("--dump", metavar="PATH",
+                         help="also write every swept row as index<TAB>text "
+                              "(verification aid)")
+    seeker = sub.add_parser("seek", parents=[common], help="scroll to turn N")
+    seeker.add_argument("n", type=int)
+    for name in ("prev", "next", "newest", "oldest", "bottom", "where"):
+        sub.add_parser(name, parents=[common])
+    args = ap.parse_args()
+
+    try:
+        pane = (args.pane
+                or os.environ.get("CCNAV_HERDR_PANE")
+                # Set for every [[keys.command]] invocation: the pane that was
+                # focused when the key was pressed.  A `pane`/`popup` binding
+                # runs in a terminal of its own, so the live focused pane is
+                # the wrong answer there and this is the right one.
+                or os.environ.get("HERDR_ACTIVE_PANE_ID")
+                or focused_pane())
+        # `where` is a pure read; everything else moves the viewport or
+        # rewrites the cache, so it goes through the per-pane lock.
+        lock = None if args.cmd == "where" else acquire_lock(pane)
+        if args.cmd == "sweep":
+            sweep(pane, verbose=True, dump=args.dump)
+            cmd_list(argparse.Namespace(refresh=False, json=False), pane)
+        elif args.cmd == "list":
+            cmd_list(args, pane)
+        elif args.cmd == "where":
+            cmd_where(args, pane)
+        elif args.cmd == "bottom":
+            cmd_bottom(args, pane)
+        else:
+            cmd_move(args, pane, args.cmd)
+    except Refused as exc:
+        print("ccnav-herdr: %s" % exc, file=sys.stderr)
+        journal("REFUSED %s" % exc)
+        notify("ccnav: pane is attached elsewhere", str(exc))
+        return 3
+    except Fail as exc:
+        print("ccnav-herdr: %s" % exc, file=sys.stderr)
+        journal("FAILED %s" % exc)
+        notify("ccnav: %s failed" % args.cmd, str(exc))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

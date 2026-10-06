@@ -1,0 +1,24 @@
+id = "space-scope"
+name = "Space-scoped agent panel"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Filter the Agents panel to the space you are in"
+platforms = ["linux"]
+
+[[startup]]
+command = ["./space-scope", "on"]
+
+[[actions]]
+id = "toggle"
+title = "Agents: toggle space scope"
+command = ["./space-scope", "toggle"]
+
+[[actions]]
+id = "on"
+title = "Agents: this space only"
+command = ["./space-scope", "on"]
+
+[[actions]]
+id = "off"
+title = "Agents: all spaces"
+command = ["./space-scope", "off"]

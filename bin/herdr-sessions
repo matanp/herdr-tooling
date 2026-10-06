@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Table of every open AI session Herdr knows about.
+
+Data comes from one `herdr api snapshot` call (agents + panes + workspaces),
+joined to OS process state via HERDR_PANE_ID, which Herdr injects into every
+pane's environment.
+
+The HELD column is a *lower bound*: Herdr's API carries no wall-clock
+timestamps for agents (only `state_change_seq`, a monotonic counter), so this
+script stamps the first time it sees each agent's current seq and reports the
+elapsed time since. A state that changed while nothing was watching reads as
+`new`. Run with --watch to keep the bounds tight.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+
+STATE_FILE = os.path.expanduser("~/.local/state/herdr-sessions/seen.json")
+
+# blocked first: that is the one that wants a human.
+STATUS_ORDER = {"blocked": 0, "working": 1, "idle": 2, "done": 3, "unknown": 4}
+STATUS_COLOR = {
+    "blocked": "\033[1;31m",
+    "working": "\033[36m",
+    "idle": "\033[2m",
+    "done": "\033[32m",
+    "unknown": "\033[2m",
+}
+RESET = "\033[0m"
+
+# rich styling, kept beside the ANSI table above so the two renderers agree.
+STATUS_GLYPH = {"blocked": "\u25c6", "working": "\u25cf", "idle": "\u25cb",
+                "done": "\u2713", "unknown": "?"}
+STATUS_STYLE = {"blocked": "bold red", "working": "bold cyan", "idle": "dim",
+                "done": "green", "unknown": "dim yellow"}
+
+
+def snapshot():
+    proc = subprocess.run(
+        ["herdr", "api", "snapshot"], capture_output=True, text=True
+    )
+    if 0 != proc.returncode:
+        sys.exit(f"herdr api snapshot failed: {proc.stderr.strip() or proc.returncode}")
+    payload = json.loads(proc.stdout)
+    if "error" in payload:
+        sys.exit(f"herdr api snapshot error: {payload['error']}")
+    return payload["result"]["snapshot"]
+
+
+def procs_by_pane():
+    """Map HERDR_PANE_ID -> [(pid, comm)] by reading /proc.
+
+    Herdr injects HERDR_PANE_ID into every pane's environment, and children
+    inherit it -- so a pane yields the agent plus any transient shell or tool
+    it spawned. Disambiguation is the caller's job (see pick_pid).
+    """
+    found = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/environ", "rb") as handle:
+                env = handle.read().decode("utf-8", "replace").split("\0")
+            with open(f"/proc/{entry}/comm") as handle:
+                comm = handle.read().strip()
+        except OSError:
+            continue
+        pane = next(
+            (v.split("=", 1)[1] for v in env if v.startswith("HERDR_PANE_ID=")), None
+        )
+        if pane is None:
+            continue
+        found.setdefault(pane, []).append((entry, comm))
+    return found
+
+
+def pick_pid(candidates, agent):
+    """The agent process itself, not a child it spawned.
+
+    Match on the comm Herdr reports as the agent ("claude" -> comm "claude").
+    Falling back to the lowest pid picks the longest-lived process in the pane,
+    which is the agent far more often than a freshly spawned child is.
+    """
+    named = [pid for pid, comm in candidates if comm == agent]
+    if named:
+        return min(named, key=int)
+    return min((pid for pid, _ in candidates), key=int) if candidates else None
+
+
+def proc_uptime(pid):
+    try:
+        with open("/proc/uptime") as handle:
+            boot_elapsed = float(handle.read().split()[0])
+        with open(f"/proc/{pid}/stat") as handle:
+            starttime = float(handle.read().rsplit(")", 1)[1].split()[19])
+        clk = os.sysconf("SC_CLK_TCK")
+        return boot_elapsed - starttime / clk
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def short_duration(seconds):
+    if seconds is None:
+        return "-"
+    seconds = int(seconds)
+    if 60 > seconds:
+        return f"{seconds}s"
+    if 3600 > seconds:
+        return f"{seconds // 60}m"
+    if 86400 > seconds:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+_branch_cache = {}
+
+
+def git_branch(cwd):
+    if cwd not in _branch_cache:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        _branch_cache[cwd] = proc.stdout.strip() if 0 == proc.returncode else ""
+    return _branch_cache[cwd]
+
+
+# Claude Code renders its own session recap into the pane as a `※ recap:` block:
+# marker at column 0, 2-space continuation lines, terminated by a blank line.
+RECAP_MARKER = "\u203b recap:"
+RECAP_TRAILER = re.compile(r"\s*\(disable recaps in\s*/config\)\s*$")
+
+# Two different things share the U+276F marker, and the byte after it tells them
+# apart -- measured, not assumed:
+#   U+276F + ASCII space -> a SUBMITTED turn, in scrollback
+#   U+276F + U+00A0      -> the LIVE COMPOSER box, i.e. text not yet sent
+# Matching both and taking the last hit picks up the composer, which can be a
+# stray keystroke. Keep them separate.
+SUBMITTED_MARKER = "\u276f "
+COMPOSER_MARKER = "\u276f\u00a0"
+
+# Reads are clamped server-side to 1000 grid rows; asking for more only sets
+# `truncated`. A recap older than that window is simply unreachable.
+READ_ROWS = 1000
+
+
+def read_pane(pane_id, rows=READ_ROWS):
+    proc = subprocess.run(
+        ["herdr", "pane", "read", pane_id, "--source", "recent",
+         "--lines", str(rows), "--format", "text"],
+        capture_output=True, text=True,
+    )
+    return proc.stdout if 0 == proc.returncode else ""
+
+
+def parse_recap(text):
+    """Last `※ recap:` block in the pane, as one collapsed line."""
+    lines = text.splitlines()
+    start = next(
+        (i for i in range(len(lines) - 1, -1, -1)
+         if lines[i].startswith(RECAP_MARKER)), None
+    )
+    if start is None:
+        return None
+    body = [lines[start][len(RECAP_MARKER):]]
+    for line in lines[start + 1:]:
+        if not line.strip() or not line.startswith("  "):
+            break
+        body.append(line)
+    joined = " ".join(" ".join(body).split())
+    return RECAP_TRAILER.sub("", joined).strip() or None
+
+
+def parse_prompts(text):
+    """(last submitted turn, unsent composer text) -- both may be None."""
+    submitted = composer = None
+    for line in reversed(text.splitlines()):
+        if submitted is None and line.startswith(SUBMITTED_MARKER):
+            submitted = line[len(SUBMITTED_MARKER):].strip() or None
+        elif composer is None and line.startswith(COMPOSER_MARKER):
+            composer = line[len(COMPOSER_MARKER):].strip() or None
+        if submitted is not None and composer is not None:
+            break
+    return submitted, composer
+
+
+def held_rows(pane):
+    """Rows the pane actually holds, capped at READ_ROWS.
+
+    herdr 0.8.0 stalls ~7ms per requested row beyond what a pane holds, so a
+    1000-row read of an alt-screen pane with no scrollback takes ~7s.
+    """
+    scroll = (pane or {}).get("scroll") or {}
+    held = (scroll.get("viewport_rows") or 0) + (scroll.get("max_offset_from_bottom") or 0)
+    return min(READ_ROWS, held) if held else READ_ROWS
+
+
+def recaps_for(pane_ids, panes=None):
+    """One pane read per session, concurrently -- they are independent."""
+    out = {}
+    if not pane_ids:
+        return out
+    rows = [held_rows((panes or {}).get(pane_id)) for pane_id in pane_ids]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for pane_id, text in zip(pane_ids, pool.map(read_pane, pane_ids, rows)):
+            out[pane_id] = (parse_recap(text),) + parse_prompts(text)
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = f"{STATE_FILE}.tmp"
+    with open(tmp, "w") as handle:
+        json.dump(state, handle)
+    os.replace(tmp, STATE_FILE)
+
+
+def collect(show_branch, want_recap):
+    snap = snapshot()
+    labels = {w["workspace_id"]: w["label"] for w in snap["workspaces"]}
+    panes = {p["pane_id"]: p for p in snap["panes"]}
+    procs = procs_by_pane()
+    state = load_state()
+    now = time.time()
+
+    rows = []
+    for agent in snap["agents"]:
+        pane_id = agent["pane_id"]
+        seq = agent.get("state_change_seq")
+        prior = state.get(pane_id)
+        if prior is None or prior.get("seq") != seq:
+            held_since, first_sighting = now, True
+        else:
+            held_since, first_sighting = prior["since"], False
+        state[pane_id] = {"seq": seq, "since": held_since}
+
+        pid = pick_pid(procs.get(pane_id, []), agent.get("agent") or "")
+        cwd = agent.get("cwd") or ""
+        rows.append(
+            {
+                "pane": pane_id,
+                "workspace": labels.get(agent["workspace_id"], agent["workspace_id"]),
+                "tab": agent.get("tab_id", ""),
+                "agent": agent.get("agent") or "?",
+                "status": agent.get("agent_status", "unknown"),
+                "focused": bool(agent.get("focused")),
+                "title": agent.get("terminal_title_stripped") or "",
+                "cwd": cwd,
+                "branch": git_branch(cwd) if show_branch and cwd else "",
+                "pid": pid,
+                "uptime_s": proc_uptime(pid) if pid else None,
+                "held_s": None if first_sighting else now - held_since,
+                "scroll_rows": panes.get(pane_id, {}).get("scroll", {}).get(
+                    "max_offset_from_bottom"
+                ),
+                "revision": agent.get("revision"),
+                "state_change_seq": seq,
+            }
+        )
+
+    if want_recap:
+        found = recaps_for([r["pane"] for r in rows], panes)
+        for row in rows:
+            row["recap"], row["last_prompt"], row["draft"] = found.get(
+                row["pane"], (None, None, None)
+            )
+
+    save_state({k: v for k, v in state.items() if k in {r["pane"] for r in rows}})
+    rows.sort(
+        key=lambda r: (
+            STATUS_ORDER.get(r["status"], 9),
+            -(r["held_s"] or 0),
+            r["pane"],
+        )
+    )
+    return rows
+
+
+def recap_lines(row, term_width, color):
+    """Claude Code's own recap, or the last user turn if it never emitted one."""
+    if row.get("recap"):
+        marker, body, tint = "\u203b", row["recap"], "\033[2m"
+    elif row.get("last_prompt"):
+        marker, body, tint = "last:", row["last_prompt"], "\033[2;3m"
+    elif row.get("draft"):
+        # Nothing submitted is readable, but there is text sitting unsent.
+        marker, body, tint = "draft:", row["draft"], "\033[2;3m"
+    else:
+        marker, body, tint = "\u203b", "(no recap in the readable window)", "\033[2m"
+    prefix = f"    {marker} "
+    wrapped = textwrap.wrap(
+        body, width=max(40, term_width - len(prefix)),
+        initial_indent=prefix, subsequent_indent=" " * len(prefix),
+    ) or [prefix.rstrip()]
+    return [tint + w + RESET if color else w for w in wrapped]
+
+
+def elide_left(text, width):
+    """Truncate keeping the tail: branch names share a long boilerplate prefix."""
+    return text if width >= len(text) else "…" + text[-(width - 1):]
+
+
+def render(rows, color, show_branch, title_width, branch_width, show_recap):
+    columns = [
+        ("PANE", lambda r: r["pane"]),
+        ("WORKSPACE", lambda r: r["workspace"]),
+        ("AGENT", lambda r: r["agent"]),
+        ("STATUS", lambda r: r["status"]),
+        ("", lambda r: "*" if r["focused"] else ""),
+        ("TITLE", lambda r: r["title"][:title_width]),
+    ]
+    if show_branch:
+        columns.append(
+            ("BRANCH", lambda r: elide_left(r["branch"] or os.path.basename(r["cwd"]), branch_width))
+        )
+    columns += [
+        ("HELD", lambda r: "new" if r["held_s"] is None else "≥" + short_duration(r["held_s"])),
+        ("UPTIME", lambda r: short_duration(r["uptime_s"])),
+        ("SCROLL", lambda r: "-" if r["scroll_rows"] is None else str(r["scroll_rows"])),
+    ]
+
+    headers = [c[0] for c in columns]
+    table = [[fn(r) for _, fn in columns] for r in rows]
+    widths = [
+        max([len(headers[i])] + [len(row[i]) for row in table])
+        for i in range(len(headers))
+    ]
+
+    out = []
+    out.append("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip())
+    out.append("  ".join("-" * w for w in widths))
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    for row, source in zip(table, rows):
+        line = "  ".join(c.ljust(widths[i]) for i, c in enumerate(row)).rstrip()
+        if color:
+            line = STATUS_COLOR.get(source["status"], "") + line + RESET
+        out.append(line)
+        if show_recap:
+            out.extend(recap_lines(source, term_width, color))
+
+    if not rows:
+        out.append("(no agent sessions)")
+    else:
+        counts = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        summary = ", ".join(
+            f"{counts[s]} {s}" for s in sorted(counts, key=lambda s: STATUS_ORDER.get(s, 9))
+        )
+        out.append("")
+        out.append(f"{len(rows)} session{'s' if 1 != len(rows) else ''}: {summary}")
+    return "\n".join(out)
+
+
+def build_rich_table(rows, show_branch, title_width, branch_width, show_recap, recap_chars):
+    """A rich Table. Cells are Text, never markup strings: recaps and terminal
+    titles contain `[`, which rich would otherwise parse as a style tag."""
+    from rich import box
+    from rich.table import Table
+    from rich.text import Text
+
+    # Columns whose value never varies are noise -- drop them.
+    multi_agent = 1 < len({r["agent"] for r in rows})
+    multi_workspace = 1 < len({r["workspace"] for r in rows})
+    branch_of = lambda r: r["branch"] or os.path.basename(r["cwd"])
+    show_branch = show_branch and 1 < len({branch_of(r) for r in rows})
+
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        header_style="bold",
+        show_edge=False,
+        pad_edge=False,
+        expand=show_recap,
+        row_styles=["", "on grey7"],
+    )
+    table.add_column("", width=1, no_wrap=True)  # focus marker
+    table.add_column("PANE", style="cyan", no_wrap=True)
+    if multi_workspace:
+        table.add_column("WORKSPACE", no_wrap=True)
+    if multi_agent:
+        table.add_column("AGENT", no_wrap=True)
+    table.add_column("STATUS", no_wrap=True)
+    table.add_column("TITLE", no_wrap=True, max_width=title_width)
+    if show_branch:
+        table.add_column("BRANCH", no_wrap=True, style="magenta")
+    table.add_column("HELD", justify="right", no_wrap=True)
+    table.add_column("UP", justify="right", no_wrap=True, style="dim")
+    table.add_column("ROWS", justify="right", no_wrap=True, style="dim")
+    if show_recap:
+        table.add_column("RECAP", ratio=1, overflow="fold", min_width=30)
+
+    for row in rows:
+        status = row["status"]
+        cells = [
+            Text("\u25b8" if row["focused"] else "", style="bold yellow"),
+            Text(row["pane"]),
+        ]
+        if multi_workspace:
+            cells.append(Text(row["workspace"]))
+        if multi_agent:
+            cells.append(Text(row["agent"]))
+        cells.append(
+            Text(f"{STATUS_GLYPH.get(status, '?')} {status}",
+                 style=STATUS_STYLE.get(status, ""))
+        )
+        cells.append(Text(clean_title(row["title"]) or "\u2014",
+                          style="bold" if row["focused"] else ""))
+        if show_branch:
+            cells.append(Text(elide_left(branch_of(row), branch_width)))
+        cells.append(
+            Text("new" if row["held_s"] is None else "\u2265" + short_duration(row["held_s"]),
+                 style="dim" if row["held_s"] is None else "")
+        )
+        cells.append(Text(short_duration(row["uptime_s"])))
+        cells.append(Text("-" if row["scroll_rows"] is None else str(row["scroll_rows"])))
+        if show_recap:
+            cells.append(recap_text(row, recap_chars))
+        table.add_row(*cells, style="bold" if "blocked" == status else None)
+
+    return table
+
+
+def clamp(text, limit):
+    """Trim to a whole word under `limit`, so a dashboard row stays scannable."""
+    if limit <= 0 or limit >= len(text):
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return (cut or text[:limit]).rstrip(" ,;:.") + "\u2026"
+
+
+def clean_title(title):
+    """Drop Claude Code's leading activity glyph -- STATUS already says that."""
+    return re.sub(r"^[^\w(\[]+\s*", "", title or "")
+
+
+def recap_text(row, limit):
+    """The recap cell, with its provenance visible in the label."""
+    from rich.text import Text
+
+    if row.get("recap"):
+        return Text(clamp(row["recap"], limit), style="none")
+    if row.get("last_prompt"):
+        out = Text("last: ", style="dim")
+        out.append(clamp(row["last_prompt"], limit), style="italic dim")
+        return out
+    if row.get("draft"):
+        out = Text("draft: ", style="yellow")
+        out.append(clamp(row["draft"], limit), style="italic yellow")
+        return out
+    return Text("\u2014 no recap in the readable window", style="dim italic")
+
+
+def summary_line(rows):
+    from rich.text import Text
+
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    out = Text(f"{len(rows)} session{'' if 1 == len(rows) else 's'}", style="bold")
+    for status in sorted(counts, key=lambda s: STATUS_ORDER.get(s, 9)):
+        out.append("  \u00b7  ", style="dim")
+        out.append(f"{counts[status]} {status}", style=STATUS_STYLE.get(status, ""))
+    return out
+
+
+def render_rich(rows, console, show_branch, title_width, branch_width, show_recap, recap_chars):
+    from rich.console import Group
+    from rich.text import Text
+
+    if not rows:
+        return Text("no agent sessions", style="dim italic")
+    return Group(
+        build_rich_table(rows, show_branch, title_width, branch_width, show_recap, recap_chars),
+        Text(''),
+        summary_line(rows),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Table of every open AI session Herdr knows about."
+    )
+    parser.add_argument("--json", action="store_true", help="emit rows as JSON")
+    parser.add_argument(
+        "--watch",
+        nargs="?",
+        const=5,
+        type=float,
+        metavar="SECS",
+        help="redraw every SECS (default 5); also keeps HELD bounds tight",
+    )
+    parser.add_argument(
+        "--status",
+        action="append",
+        metavar="S",
+        help="only show these statuses; repeatable (e.g. --status blocked)",
+    )
+    parser.add_argument(
+        "--recap",
+        action="store_true",
+        help="show each session's Claude Code recap (one pane read per session)",
+    )
+    parser.add_argument(
+        "--no-recap",
+        action="store_true",
+        help="with --json, skip the per-session pane reads (recap, last_prompt, draft)",
+    )
+    parser.add_argument("--no-branch", action="store_true", help="skip the git branch lookup")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="plain ASCII-aligned output (the default when stdout is not a tty)",
+    )
+    parser.add_argument(
+        "--rich", action="store_true", help="force the rich renderer even through a pipe"
+    )
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--title-width", type=int, default=44)
+    parser.add_argument("--branch-width", type=int, default=22)
+    parser.add_argument(
+        "--recap-chars",
+        type=int,
+        default=200,
+        help="clamp each recap to this many characters (0 = no clamp)",
+    )
+    args = parser.parse_args()
+
+    show_branch = not args.no_branch
+    color = not args.no_color and sys.stdout.isatty()
+    # rich for humans, plain for pipes -- so `| grep` keeps working untouched.
+    use_rich = not args.json and not args.plain and (args.rich or sys.stdout.isatty())
+    if use_rich:
+        try:
+            import rich  # noqa: F401
+        except ImportError:
+            # The plain renderer is self-contained, so a missing rich degrades
+            # rather than crashes.
+            print("herdr-sessions: rich not installed, falling back to --plain",
+                  file=sys.stderr)
+            use_rich = False
+
+    def fetch():
+        rows = collect(show_branch, args.recap or (args.json and not args.no_recap))
+        if args.status:
+            wanted = {s.lower() for s in args.status}
+            rows = [r for r in rows if r["status"] in wanted]
+        return rows
+
+    if args.json:
+        print(json.dumps(fetch(), indent=2))
+        return
+
+    if not use_rich:
+        def once():
+            return render(fetch(), color, show_branch, args.title_width,
+                          args.branch_width, args.recap)
+
+        if args.watch is None:
+            print(once())
+            return
+        try:
+            while True:
+                sys.stdout.write("\n")
+                print(time.strftime("herdr-sessions  %H:%M:%S"))
+                print()
+                print(once())
+                sys.stdout.flush()
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    from rich.console import Console
+
+    console = Console(no_color=args.no_color)
+
+    def renderable():
+        return render_rich(fetch(), console, show_branch, args.title_width,
+                           args.branch_width, args.recap, args.recap_chars)
+
+    if args.watch is None:
+        console.print(renderable())
+        return
+
+    from rich.live import Live
+
+    try:
+        with Live(console=console, refresh_per_second=4, transient=False) as live:
+            while True:
+                live.update(renderable())
+                time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

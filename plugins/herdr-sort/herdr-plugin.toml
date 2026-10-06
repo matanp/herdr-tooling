@@ -1,0 +1,24 @@
+id = "herdr-sort"
+name = "Auto-sort tabs into workspaces"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Route agent tabs into workspaces by session title"
+platforms = ["linux"]
+
+[[startup]]
+command = ["./run", "daemon"]
+
+[[actions]]
+id = "once"
+title = "Sort: apply now"
+command = ["./run", "once"]
+
+[[actions]]
+id = "plan"
+title = "Sort: what would move"
+command = ["./run", "plan"]
+
+[[actions]]
+id = "pause"
+title = "Sort: pause daemon"
+command = ["./run", "pause"]

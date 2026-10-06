@@ -1,0 +1,44 @@
+# Entry point for ccnav-herdr — append to ~/.config/herdr/config.toml.  Reload after editing: `herdr server reload-config`
+# (or prefix+shift+r).  To revert, delete these blocks and reload — do NOT use
+# `herdr config reset-keys`, which wipes every custom binding.
+#
+# No plugin is needed: every [[keys.command]] invocation is handed
+# HERDR_ACTIVE_PANE_ID, the pane focused when the key was pressed, and
+# ccnav-herdr defaults its target to it.  type = "shell" runs detached with no
+# terminal, which is what a viewport move wants — nothing to render.  Because
+# there is no terminal, failures are reported as a Herdr toast and appended to
+# ~/.local/state/ccnav-herdr/nav.log.
+#
+# Plain letters after the prefix, deliberately: the alt modifier's delivery is
+# terminal-dependent (Herdr's own config says so), and a prefix chord steals
+# nothing from Claude Code.  u/d/f/a are all unbound in Herdr's defaults.
+
+[[keys.command]]
+key = "prefix+u"           # previous turn
+type = "shell"
+command = "~/.local/bin/ccnav-herdr prev"
+
+[[keys.command]]
+key = "prefix+d"           # next turn
+type = "shell"
+command = "~/.local/bin/ccnav-herdr next"
+
+[[keys.command]]
+key = "prefix+f"           # newest turn (front)
+type = "shell"
+command = "~/.local/bin/ccnav-herdr newest"
+
+[[keys.command]]
+key = "prefix+a"           # back to the live tail
+type = "shell"
+command = "~/.local/bin/ccnav-herdr bottom"
+
+# A picker belongs in a popup, not a shell: popup invocations get a tty and
+# TERM=xterm-256color, and they still carry HERDR_ACTIVE_PANE_ID (they do NOT
+# get HERDR_PANE_ID — a popup is not a registered pane).  Unbuilt.
+# [[keys.command]]
+# key = "prefix+t"
+# type = "popup"
+# command = "~/.local/bin/ccnav-herdr-picker"
+# width = "80%"
+# height = "60%"

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Plugin entry point: herdr runs plugin commands from the plugin root, but a
+# key binding runs this by absolute path, so resolve the directory either way.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "${1:-tui}" in
+  open-tab)
+    exec herdr plugin pane open --plugin herdr-dash --entrypoint dash \
+      --placement tab --focus
+    ;;
+  *) exec "$here/dash" "$@" ;;
+esac
