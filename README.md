@@ -17,6 +17,7 @@ Nothing here installs itself. Copy or symlink each piece to the location herdr a
 | `config/sort-rules.example.toml` | `~/.config/herdr/sort-rules.toml`, edited for your projects |
 | `config/ccnav-keys.example.toml` | key reference for `ccnav-herdr` |
 | `hooks/herdr-project-brief.py` | `~/.claude/hooks/`, registered as a Claude Code `SessionStart` hook |
+| `skills/close/` | symlinked as `~/.claude/skills/close` |
 
 Tool state and logs go to `~/.local/state/herdr-*/`.
 
@@ -63,6 +64,12 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 `herdr-project-brief.py` — on `SessionStart`, resolves the pane's herdr workspace and injects
 that workspace's `brief` from `sort-rules.toml` as context, so an unqualified prompt resolves
 to the right project. Silent on every failure path.
+
+## Claude Code skill
+
+`/close` — the in-session counterpart of `herdr-sort cull`. Checks the session's open items
+live, pushes back while any are still the session's to finish, otherwise ends on a close report
+and the `herdr-sort close --as <d>` command for this pane. User-invoked only.
 
 ## Keys
 
