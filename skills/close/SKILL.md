@@ -100,10 +100,11 @@ Linear — write it for the user reading it weeks from now.
 
 Then give the close command, built from the verdict:
 
-    herdr-sort close --as <disposition> [--ref <ticket>] [--note "<one line>"] --yes "$HERDR_PANE_ID"
+    herdr-sort close --as <disposition> [--ref <ticket>] [--note "<one line>"] --yes --self
 
 and ask for a go-ahead. On a yes, run it as your **last tool call** — it closes this pane, and
-the Linear write happens before the pane goes. The report must already be in an earlier turn for
+the Linear write happens before the pane goes. `--self` is what lets it close the focused tab;
+a pane id in its place is refused as "the tab you're in", with nothing written. The report must already be in an earlier turn for
 `herdr-sort` to read it, which is why the command never runs in the same turn as the report.
 
 When `HERDR_PANE_ID` is unset, the session is not in herdr: deliver the report and stop.
