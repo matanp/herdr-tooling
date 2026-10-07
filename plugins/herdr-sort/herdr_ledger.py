@@ -23,15 +23,18 @@ INDEX_PATH = os.path.join(STATE_DIR, "sessions.json")
 CLOSES_PATH = os.path.join(STATE_DIR, "closes.jsonl")
 SCROLLBACK_DIR = os.path.join(STATE_DIR, "scrollback")
 
-CLAUDE_GLOB = os.path.expanduser("~/.claude/projects/*/*.jsonl")
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CLAUDE_GLOB = os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")
 CODEX_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
 CODEX_GLOBS = [os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"),
                os.path.expanduser("~/.codex/archived_sessions/rollout-*.jsonl")]
 
 SUMMARY_MODEL = "claude-haiku-4-5-20251001"
-# Summaries run from here so their own (unpersisted) sessions never land in a
-# project directory the ledger scans.
+# The tool's own claude -p runs start from these, so _sources() can recognise and
+# skip their project folders; the cull runs are persisted for `claude --resume`.
 SUMMARY_CWD = os.path.join(STATE_DIR, "summarize")
+MODEL_CWD = os.path.join(STATE_DIR, "cull-runs")
+CLOSE_FIELDS = ("disposition", "note", "ref", "ref_url", "model_session")
 
 ENGAGED_GAP_S = 1800
 ENGAGED_CAP_S = 300
@@ -51,6 +54,15 @@ def _ts(text):
         return datetime.datetime.fromisoformat(text).timestamp()
     except ValueError:
         return None
+
+
+def claude_project_dir(cwd):
+    return os.path.join(CLAUDE_PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def _own_run(path):
+    folder = os.path.dirname(path or "")
+    return folder in (claude_project_dir(SUMMARY_CWD), claude_project_dir(MODEL_CWD))
 
 
 def _clip(text, limit):
@@ -245,7 +257,8 @@ def save_index(index):
         for key, disk in load_index().items():
             mine = index.get(key)
             if mine is None:
-                index[key] = disk
+                if not _own_run(disk.get("file")):
+                    index[key] = disk
             elif disk.get("summary") and not mine.get("summary"):
                 for field in SUMMARY_FIELDS:
                     if field in disk:
@@ -258,7 +271,7 @@ def save_index(index):
 
 def _sources():
     for path in glob.glob(CLAUDE_GLOB):
-        if os.path.dirname(path) != SUMMARY_CWD:
+        if not _own_run(path):
             yield "claude", path
     for pattern in CODEX_GLOBS:
         for path in glob.glob(pattern):
@@ -268,6 +281,8 @@ def _sources():
 def sync(index=None, only=None, progress=None):
     """Re-parse transcripts whose size or mtime moved; keep summaries across re-parses."""
     index = load_index() if index is None else index
+    for key in [k for k, r in index.items() if _own_run(r.get("file"))]:
+        del index[key]
     names = _codex_names()
     by_file = {r.get("file"): r for r in index.values()}
     todo = []
@@ -560,14 +575,38 @@ def assess(index=None):
 # --- close / reopen ---------------------------------------------------------
 
 def closes():
-    rows = []
+    """Close events, oldest first. A resolve line replaces the disposition fields of the
+    close it names (same key and closed_at; the latest resolve wins whole) and is never
+    returned itself."""
+    rows, by_close = [], {}
     if os.path.exists(CLOSES_PATH):
         for line in open(CLOSES_PATH, errors="replace"):
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except ValueError:
                 continue
+            if "resolve" == row.get("kind"):
+                target = by_close.get((row.get("key"), row.get("closed_at")))
+                if target is not None:
+                    event, base = target
+                    event.clear()
+                    event.update(base)
+                    event.update({k: v for k, v in row.items()
+                                  if k not in ("kind", "key", "closed_at")})
+                continue
+            rows.append(row)
+            by_close[(row.get("key"), row.get("closed_at"))] = (row, dict(row))
     return rows
+
+
+def append_resolution(key, closed_at, fields):
+    """Give an already-closed session its disposition without rewriting the ledger."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    line = {"kind": "resolve", "key": key, "closed_at": closed_at}
+    line.update({k: v for k, v in fields.items() if k in CLOSE_FIELDS})
+    with open(CLOSES_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line) + "\n")
+    return line
 
 
 def _save_scrollback(row):
@@ -586,8 +625,10 @@ def _save_scrollback(row):
     return path
 
 
-def close(rows, index):
-    """Record first, close second: a row that fails to record is never closed."""
+def close(rows, index, extra=None):
+    """Record first, close second: a row that fails to record is never closed.
+
+    extra maps pane_id to disposition fields (CLOSE_FIELDS) for that row's event."""
     done = []
     os.makedirs(STATE_DIR, exist_ok=True)
     # Counted down per close, not read off the snapshot: a batch that sees one
@@ -610,6 +651,8 @@ def close(rows, index):
                  "resume": (rec or {}).get("resume"),
                  "uncommitted": (code + fresh + docs)[:30],
                  "scrollback": _save_scrollback(row)}
+        event.update({k: v for k, v in ((extra or {}).get(row["pane_id"]) or {}).items()
+                      if k in CLOSE_FIELDS})
         with open(CLOSES_PATH, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event) + "\n")
         try:

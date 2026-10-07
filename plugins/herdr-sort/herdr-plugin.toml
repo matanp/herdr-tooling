@@ -22,3 +22,20 @@ command = ["./run", "plan"]
 id = "pause"
 title = "Sort: pause daemon"
 command = ["./run", "pause"]
+
+# `herdr-sort popup` opens this over the socket (the CLI has no popup
+# placement) and sets HERDR_SORT_POPUP, which makes the walk wait for a key
+# before its pane closes.
+[[panes]]
+id = "cull"
+title = "Cull open tabs"
+description = "One card per open tab: close it with a disposition, file it, or keep it"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["./run", "cull"]
+
+[[actions]]
+id = "cull"
+title = "Sort: cull open tabs"
+command = ["./run", "popup"]

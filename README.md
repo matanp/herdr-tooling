@@ -25,6 +25,18 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 - **`herdr-sessions`** — table of open agent sessions; `--watch`, `--json`, `--status blocked`.
 - **`herdr-sort`** — routes tabs into workspaces by session title (`sort-rules.toml`);
   KEEP / GLANCE / CLOSE ratings, close with a reopenable ledger.
+  - Every close takes a disposition: `done`, `filed`, `merged`, `dropped` (needs `--note`),
+    `trivial`. `close --as <d> [--ref GROWTH-n] [--note ...] <tabs>`; bare `close` refuses.
+  - `done` / `filed` / `merged` go to Linear first (comment on a referenced issue, else a new
+    issue in the suggested project); a Linear failure closes nothing.
+  - `cull` walks open tabs: one confirmation for trivial and verified-done tabs, then one card
+    per tab or group with a Sonnet draft, checked open items and a single-key decision.
+    `popup` opens it as a herdr popup.
+  - `loops` finds closed sessions whose next step went nowhere, clears the ones a later
+    session resolved, and walks the rest. `review --since 7d` groups closes by disposition.
+  - Model runs go through `claude -p` (`HERDR_CULL_MODEL`), persisted under
+    `~/.local/state/herdr-sort/cull-runs` so `w` on a card can `claude --resume` them;
+    close notes are cached in `notes.json`, keyed by transcript size.
 - **`herdr-compose`** — `prefix+i`: nvim split under the agent for the next prompt,
   `Ctrl-S` sends. `prefix+shift+k/j` scroll the agent.
 - **`ccnav-herdr`** — turn navigation, `prefix+u/d/f/a` (prev / next / newest / bottom),
@@ -34,7 +46,8 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 
 - **`herdr-dash`** — `prefix+m`: agents, memory by pane, `MEMORY.md` health,
   prefix cheat-sheet, notes. Set `HERDR_DASH_MEMORY_DIR` to your Claude Code memory directory.
-- **`herdr-sort`** — plugin wrapper and close ledger for `bin/herdr-sort`.
+- **`herdr-sort`** — plugin wrapper, close ledger and cull core for `bin/herdr-sort`;
+  the `cull` popup entrypoint and its action.
 - **`space-scope`** — `prefix+shift+s`: toggles the Agents panel between the current space and all spaces.
   Uses `agent.view.set`; reapplied on server start.
 - **`viewer`** — `prefix+shift+v` browse, `prefix+y` copy.
