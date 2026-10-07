@@ -1,3 +1,5 @@
+import importlib.machinery
+import importlib.util
 import os
 import tempfile
 import unittest
@@ -505,6 +507,55 @@ class LedgerScan(unittest.TestCase):
                     MODEL_CWD=run_dir, SUMMARY_CWD=os.path.join(projects, "x", "summarize")):
                 found = [path for _, path in ledger._sources()]
         self.assertEqual([paths["user"]], found)
+
+
+def load_cli():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin", "herdr-sort")
+    loader = importlib.machinery.SourceFileLoader("herdr_sort_cli", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+class CloseSelf(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+        self.rows = [row("p1", "k1", focused=True), row("p2", "k2")]
+        self.assessed = []
+        patches = [
+            mock.patch.object(self.cli.ledger, "assess", return_value=(self.rows, {})),
+            mock.patch.object(self.cli, "_assess",
+                              side_effect=lambda rows, *_: (self.assessed.extend(rows)
+                                                            or ([], None, None))),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def close(self, rest=(), **args):
+        return self.cli.cmd_close(dict({"as": "filed", "self": True}, **args), list(rest))
+
+    def test_targets_the_calling_pane_and_lifts_its_focus_guard(self):
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "p1"}):
+            self.close()
+        self.assertEqual(["p1"], [r["pane_id"] for r in self.assessed])
+        self.assertFalse(self.assessed[0]["focused"])
+
+    def test_without_self_a_focused_tab_keeps_its_guard(self):
+        self.cli.cmd_close({"as": "filed"}, ["p1"])
+        self.assertTrue(self.assessed[0]["focused"])
+
+    def test_refuses_outside_herdr(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit):
+                self.close()
+
+    def test_refuses_other_targets(self):
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "p1"}):
+            with self.assertRaises(SystemExit):
+                self.close(rest=["p2"])
+            with self.assertRaises(SystemExit):
+                self.close(safe=True)
 
 
 if __name__ == "__main__":

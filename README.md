@@ -69,7 +69,7 @@ to the right project. Silent on every failure path.
 
 `/close` — the in-session counterpart of `herdr-sort cull`. Checks the session's open items
 live, pushes back while any are still the session's to finish, otherwise ends on a close report
-and the `herdr-sort close --as <d>` command for this pane. User-invoked only.
+and `herdr-sort close --as <d> --self` for this pane. User-invoked only.
 
 ## Keys
 
