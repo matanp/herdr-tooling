@@ -21,7 +21,10 @@ usage: herdr-sort <command> [options]
                        ones as trivial, verified-done ones as done, the rest listed and
                        left open; with --as D, all of it as D
   cull                 walk every open tab: one sweep for trivial and verified-done tabs,
-                       then one card and one key per tab (or group sharing a PR/ticket/file)
+                       then one card and one key per tab (or group sharing a PR/ticket/file).
+                       Optionally sends /close to chosen closeable Claude tabs first, then
+                       answers their reports: yes to every close offer at once, then one
+                       card per keep or question, until each tab closes itself or is left
   popup                open `cull` as a herdr popup
   loops                closed sessions whose next step went nowhere: clear the ones a
                        later session resolved, then file / drop / mark trivial the rest
@@ -48,6 +51,10 @@ cull / loops keys:
   d done (only when every check passes)  f file  m merge  x drop  t trivial  k keep
   s skip (loops)  n note (saved per session, filed with the card)  j jump to tab
   e edit draft in nvim  p project  w why  q quit
+
+/close report keys:
+  y yes (an offer: close it; a keep: do the work, then report again)  f close anyway as filed
+  r reply  x drop  c /close again  v view the reply  j jump  k leave open  q quit
 """
 
 import fcntl
@@ -55,6 +62,7 @@ import json
 import datetime
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -1405,6 +1413,333 @@ def _walk(cards, closer, llm, keys, others=None, popup=False):
     return 0
 
 
+# --- /close: closeable tabs check themselves, then the user answers each report ---
+
+# Agents word the keep line freely ("keep, with 1 item blocking", "don't close yet"), and a
+# code review's "**Verdict:** CONFIRMED" must not read as a close report.
+REPORT_VERDICT = re.compile(r"\*\*Verdict:?\*\*:?\s*((?:keep|close|don.t close)[^\n]*)", re.I)
+REPORT_COMMAND = re.compile(r"herdr-sort close\b[^\n`]*?--self\b[^\n`]*")
+REPORT_FIELD = re.compile(r"^\*\*(Outcome|Next step):\*\*\s*(.+)$", re.M)
+REPORT_ITEM = re.compile(r"^\s*-\s*\[(fail|manual|unverified)\]\s*(.+)$", re.M | re.I)
+TAIL_BYTES = 1 << 19
+USHER_POLL_S = 2
+STALL_S = 30
+SAY_YES = "yes"
+SAY_DO_IT = ("yes, do it. Then re-run the close checks and end on the close report and "
+             "command; don't ask me to type /close again.")
+SAY_FILE = "close anyway, as filed"
+USHER_KEYS = {
+    "offer": {"y": "yes, close it", "r": "reply", "x": "drop", "c": "/close again",
+              "v": "view", "j": "jump", "k": "leave open", "q": "quit"},
+    "keep": {"y": "do it", "f": "close anyway as filed", "r": "reply", "x": "drop",
+             "c": "/close again", "v": "view", "j": "jump", "k": "leave open", "q": "quit"},
+    "reply": {"y": "yes", "r": "reply", "c": "/close again", "v": "view", "j": "jump",
+              "k": "leave open", "q": "quit"},
+}
+
+
+def _tail_reply(path):
+    """(text, timestamp) of the last assistant text in a Claude transcript, read from its end."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - TAIL_BYTES))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        if '"assistant"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if "assistant" != row.get("type") or row.get("isSidechain"):
+            continue
+        content = (row.get("message") or {}).get("content")
+        texts = [b["text"] for b in content if isinstance(b, dict)
+                 and "text" == b.get("type") and b.get("text", "").strip()] \
+            if isinstance(content, list) else []
+        if texts:
+            return texts[-1], ledger._ts(row.get("timestamp"))
+    return None, None
+
+
+def _report(text):
+    text = text or ""
+    verdict = REPORT_VERDICT.search(text)
+    verdict = verdict.group(1).strip() if verdict else None
+    commands = REPORT_COMMAND.findall(text)
+    command = commands[-1].strip().rstrip("`") if commands else None
+    keep = verdict is not None and not verdict.lower().startswith("close")
+    kind = "keep" if keep else "offer" if command else "reply"
+    disposition = re.search(r"--as\s+(\w+)", command or "")
+    note = re.search(r'--note\s+"([^"]*)"', command or "")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text)
+                  if p.strip() and "herdr-sort close" not in p and not p.strip().startswith("```")]
+    ask = paragraphs[-1] if paragraphs else ""
+    items = sorted(REPORT_ITEM.findall(text), key=lambda i: 0 if "fail" == i[0].lower() else 1)
+    return {"kind": kind, "verdict": verdict, "command": command,
+            "disposition": disposition.group(1) if disposition else None,
+            "note": note.group(1) if note else None,
+            "fields": REPORT_FIELD.findall(text), "items": items,
+            # "Run it?" alone is the go-ahead; anything longer bundles a second question
+            # that a bare "yes" would leave unanswered.
+            "side": ask if "offer" == kind and (len(ask) > 60 or ask.count("?") > 1) else None}
+
+
+def _usher_item(row, text=None, stamp=None):
+    return {"pane_id": row["pane_id"], "workspace": row["workspace"],
+            "title": row["title"] or row["rec"].get("title") or "(untitled)",
+            "file": row["rec"]["file"], "state": "ready" if text else "waiting",
+            "reply": text, "replied_at": stamp, "sent_at": 0, "calm": 0, "said": None,
+            "blocked": False, "stalled": False}
+
+
+def _close_candidates(rows):
+    """(pending, sendable): idle Claude tabs already ending on a /close report, and the
+    CLOSE-verdict ones /close could be sent to. Trivial tabs close in the sweep instead."""
+    trivial = _cull()[0]._trivial
+    pending, sendable = [], []
+    for row in rows:
+        rec = row.get("rec")
+        if "claude" != row.get("agent") or not rec or _held(row):
+            continue
+        text, stamp = _tail_reply(rec["file"])
+        if REPORT_VERDICT.search(text or ""):
+            pending.append(_usher_item(row, text, stamp))
+        elif "CLOSE" == row["verdict"] and not trivial(row, rec):
+            sendable.append(row)
+    return pending, sendable
+
+
+def _say(item, text, closing=False):
+    try:
+        ledger.call("agent.prompt", {"target": item["pane_id"], "text": text})
+    except (RuntimeError, OSError) as err:
+        print(f"  could not reach {shorten(item['title'], 40)!r}: {err}")
+        return False
+    item.update(state="closing" if closing else "waiting", sent_at=time.time(), calm=0,
+                said=text, blocked=False, stalled=False)
+    return True
+
+
+def _offer_close(rows):
+    """The usher items for this cull: tabs already ending on a report, plus the
+    closeable ones the user agrees to send /close to."""
+    pending, sendable = _close_candidates(rows)
+    if pending:
+        print(f"{len(pending)} tabs already end on a /close report; they come after the cards")
+    if not sendable:
+        return pending
+    print(f"\n{len(sendable)} closeable tabs can check themselves with /close:")
+    for n, row in enumerate(sendable, 1):
+        print(f" {n:>3} {shorten(row['workspace'], 19):<19} "
+              f"{shorten(row['title'] or '?', 46):<46} {row['reason']}")
+    # Each /close re-reads a long-idle session's whole context uncached, so the
+    # broadcast is chosen, not implied.
+    chosen = _pick(_line("send /close to (y all, numbers like 1-4 7, enter none): "),
+                   len(sendable))
+    if not chosen:
+        print("sent nothing; those tabs get cards instead")
+        return pending
+    rows = [sendable[n - 1] for n in chosen]
+    sent = [i for i in (_usher_item(row) for row in rows) if _say(i, "/close")]
+    print(f"sent /close to {len(sent)}; they work while you walk the cards\n")
+    return pending + sent
+
+
+def _pick(answer, count):
+    """1-based picks from "y", "all" or "1-4 7"; [] for anything else."""
+    answer = answer.strip().lower()
+    if answer in ("y", "yes", "a", "all"):
+        return list(range(1, count + 1))
+    picked = []
+    for part in re.split(r"[\s,]+", answer):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            return []
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        picked += [n for n in range(lo, hi + 1) if 1 <= n <= count and n not in picked]
+    return picked
+
+
+def _usher_poll(items):
+    live = [i for i in items if i["state"] in ("waiting", "closing")]
+    if not live:
+        return
+    try:
+        panes = {p["pane_id"]: p for p in ledger.call("session.snapshot")["snapshot"]["panes"]}
+    except (RuntimeError, OSError):
+        return
+    now = time.time()
+    for item in live:
+        pane = panes.get(item["pane_id"])
+        if pane is None:
+            item["state"] = "closed"
+            continue
+        status = pane.get("agent_status")
+        if "working" == status:
+            item["calm"], item["started"] = 0, True
+            continue
+        text, stamp = _tail_reply(item["file"])
+        if "blocked" == status:
+            item.update(state="ready", reply=text, replied_at=stamp, blocked=True)
+            continue
+        if (stamp or 0) < item["sent_at"] - 1:
+            if not item.get("started") and now - item["sent_at"] > STALL_S:
+                item.update(state="ready", reply=text, replied_at=stamp, stalled=True)
+            continue
+        # Idle twice in a row: one idle poll can fall between two tool calls.
+        item["calm"] += 1
+        if item["calm"] >= 2:
+            item.update(state="ready", reply=text, replied_at=stamp)
+
+
+def _batchable(item):
+    rep = _report(item["reply"])
+    return ("offer" == rep["kind"] and not rep["side"] and not item["blocked"]
+            and not item["stalled"] and SAY_YES != item["said"])
+
+
+def _key_within(seconds):
+    """A key pressed within `seconds`, or None; sleeps when there is no terminal."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        time.sleep(seconds)
+        return None
+    try:
+        if not os.isatty(fd):
+            time.sleep(seconds)
+            return None
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            ready, _, _ = select.select([fd], [], [], seconds)
+            return os.read(fd, 4).decode("utf-8", "replace")[:1].lower() if ready else None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    finally:
+        os.close(fd)
+
+
+def _page(text):
+    try:
+        subprocess.run(["less", "-R"], input=(text or "").encode(), check=False)
+    except OSError as err:
+        print(f"  cannot run less: {err}")
+
+
+def _print_usher(item, left):
+    rep = _report(item["reply"])
+    print(f"\n[{left} to answer] {item['title']}")
+    age = f" · replied {ledger.human(time.time() - item['replied_at'])} ago" \
+        if item.get("replied_at") else ""
+    print(f"  {item['workspace']} · {item['pane_id']}{age}")
+    if item["said"] and "/close" != item["said"]:
+        print(_wrap("you said", item["said"]))
+    if item["blocked"]:
+        print(_wrap("blocked", "waiting on a permission prompt; j answers it in the tab"))
+    if item["stalled"]:
+        print(_wrap("stalled", f"{item['said']!r} never started; j to look at the tab"))
+    if SAY_YES == item["said"] and "offer" == rep["kind"]:
+        print(_wrap("still open", "it was told yes and did not close; read why below"))
+    if "reply" == rep["kind"]:
+        lines = (item["reply"] or "(no reply)").strip().splitlines()
+        if len(lines) > 14:
+            print(f"           … {len(lines) - 14} lines above (v reads all)")
+        for line in lines[-14:]:
+            print(f"           {shorten(line, 110)}")
+        return
+    print(_wrap("verdict", rep["verdict"] or "(no verdict line)"))
+    for label, value in rep["fields"]:
+        print(_wrap(label.lower(), value))
+    for result, text in rep["items"][:CARD_ITEMS]:
+        print(_wrap(f"  {result.upper() if 'fail' == result.lower() else result}", text))
+    if len(rep["items"]) > CARD_ITEMS:
+        print(f"           … {len(rep['items']) - CARD_ITEMS} more open items (v reads all)")
+    if rep["command"]:
+        print(_wrap("command", rep["command"]))
+    if rep["side"]:
+        print(_wrap("also asks", rep["side"]))
+
+
+def _usher(items, popup):
+    """Answer each tab's /close report until it closes itself or is left open."""
+    offered = set()
+    shown = None
+    while True:
+        _usher_poll(items)
+        ready = [i for i in items if "ready" == i["state"]]
+        busy = [i for i in items if i["state"] in ("waiting", "closing")]
+        if not ready and not busy:
+            return
+        if not ready:
+            closing = sum("closing" == i["state"] for i in busy)
+            line = (f"  waiting on {len(busy)}" + (f" ({closing} closing)" if closing else "")
+                    + ": " + ", ".join(shorten(i["title"], 24) for i in busy[:4])
+                    + (" …" if len(busy) > 4 else "") + "  (q stops waiting)")
+            if line != shown:
+                print(line, flush=True)
+                shown = line
+            if "q" == _key_within(USHER_POLL_S):
+                return
+            continue
+        shown = None
+        batch = [i for i in ready if i["pane_id"] not in offered and _batchable(i)]
+        if len(batch) > 1:
+            offered.update(i["pane_id"] for i in batch)
+            print(f"\n{len(batch)} offer to close themselves:")
+            for item in batch:
+                rep = _report(item["reply"])
+                fails = sum("fail" == r.lower() for r, _ in rep["items"])
+                print(f"  {rep['disposition'] or '?':<8} {shorten(item['workspace'], 19):<19} "
+                      f"{shorten(item['title'], 46)}" + (f"  ({fails} FAIL)" if fails else ""))
+                if rep["note"]:
+                    print(f"           {shorten(rep['note'], 100)}")
+            if _yes(f"say yes to all {len(batch)}? (no walks them one by one) [y/N] "):
+                for item in batch:
+                    _say(item, SAY_YES, closing=True)
+                continue
+        item = ready[0]
+        kind = _report(item["reply"])["kind"]
+        _print_usher(item, len(ready))
+        keys = USHER_KEYS[kind]
+        key = _key("  " + "  ".join(f"{k} {v}" for k, v in keys.items()) + " > ", keys)
+        if "q" == key:
+            return
+        if "k" == key:
+            item["state"] = "left"
+            continue
+        if "v" == key:
+            _page(item["reply"])
+            continue
+        if "j" == key:
+            if _jump({"members": [{"row": {"pane_id": item["pane_id"]}}]}, popup):
+                return
+            continue
+        if "r" == key:
+            text = _line("  reply: ")
+        elif "x" == key:
+            reason = _line("  why drop it? (enter cancels) ")
+            text = reason and f"close it as dropped: {reason}"
+        else:
+            text = {"y": SAY_DO_IT if "keep" == kind else SAY_YES, "f": SAY_FILE,
+                    "c": "/close"}[key]
+        if text:
+            _say(item, text, closing="y" == key and "offer" == kind)
+
+
+def _usher_summary(items):
+    counts = {}
+    for item in items:
+        counts[item["state"]] = counts.get(item["state"], 0) + 1
+    names = {"closed": "closed themselves", "left": "left open", "ready": "unanswered",
+             "waiting": "still working", "closing": "still closing"}
+    return "; ".join(f"{n} {names[s]}" for s, n in counts.items())
+
+
 def _pause_if_popup(popup):
     if popup:
         _line("\nenter closes the popup ")
@@ -1428,7 +1763,9 @@ def cmd_cull(args, rest):
         if not rows:
             print("no open tabs")
             return 0
-        cards, linear, llm = _assess(rows, index, [])
+        ushered = _offer_close(rows)
+        skip = {i["pane_id"] for i in ushered}
+        cards, linear, llm = _assess([r for r in rows if r["pane_id"] not in skip], index, [])
         everything = [c for c in cards if "open" == c["kind"]]
         held = [c for c in everything if all(_held(m.get("row") or {}) for m in c["members"])]
         cards = sorted((c for c in everything if c not in held), key=_verdict_rank)
@@ -1450,7 +1787,12 @@ def cmd_cull(args, rest):
         kept = len(walk) - left - sum(c["id"] in closer.done_ids for c in walk)
         print(f"\nclosed {closer.closed} tabs; kept {kept} cards"
               + (f"; {left} not reached" if left else ""))
-        log(f"cull closed {closer.closed} tabs")
+        if ushered:
+            print(f"\n/close reports from {len(ushered)} tabs")
+            _usher(ushered, popup)
+            print(f"\n/close: {_usher_summary(ushered)}")
+        log(f"cull closed {closer.closed} tabs"
+            + (f"; /close: {_usher_summary(ushered)}" if ushered else ""))
         return 0
     finally:
         _pause_if_popup(popup)

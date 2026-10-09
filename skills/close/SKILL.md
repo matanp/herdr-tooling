@@ -62,6 +62,10 @@ Pushing back means: name each blocking item with its check result, propose the c
 action for each, and stop. Write no close report and no docs yet. If the user then says to close
 anyway, close as `filed` with those items carried in the report — not as `done`.
 
+When the user approves the proposed work, do it, re-run the checks, and end that turn on the
+close report. Never ask the user to type `/close` again: `herdr-sort cull` answers these
+sessions in a batch and is waiting for the report, not for another prompt.
+
 **Close** otherwise, with one disposition:
 
 - `done` — every check passes and nothing is left that anyone must do.
@@ -95,14 +99,20 @@ Linear — write it for the user reading it weeks from now.
 **Open items:**
 - [pass|fail|manual] <kind> — <text> (<check and its detail>)
 **Artifacts:** PRs #…, tickets GROWTH-…, branches, worktrees, docs
-**Resume:** <the resume command for this session, if known>
+**Resume:** claude --resume <session id>
 ```
+
+`herdr-sort cull` parses the first line, so keep it to exactly one of the two forms shown. The
+session id is `agent_session.value` in `herdr pane get "$HERDR_PANE_ID"`; the newest file in the
+project directory is often another session's.
 
 Then give the close command, built from the verdict:
 
     herdr-sort close --as <disposition> [--ref <ticket>] [--note "<one line>"] --yes --self
 
-and ask for a go-ahead. On a yes, run it as your **last tool call** — it closes this pane, and
+and ask for a go-ahead as a bare yes/no question, such as "Run it?". The user often answers a
+batch of tabs with one "yes", so anything else bundled onto that line goes unanswered. An
+optional `--ref`, a cleanup or a side offer belongs in the open items or in a keep. On a yes, run it as your **last tool call** — it closes this pane, and
 the Linear write happens before the pane goes. `--self` is what lets it close the focused tab;
 a pane id in its place is refused as "the tab you're in", with nothing written. The report must already be in an earlier turn for
 `herdr-sort` to read it, which is why the command never runs in the same turn as the report.

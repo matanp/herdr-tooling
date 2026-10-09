@@ -33,6 +33,11 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   - `cull` walks open tabs: one confirmation for trivial and verified-done tabs, then one card
     per tab or group with a Sonnet draft, checked open items and a single-key decision.
     `popup` opens it as a herdr popup.
+  - Before the cards, `cull` offers to send `/close` to the closeable Claude tabs you pick
+    (CLOSE verdict, idle, not trivial). They audit themselves while you walk the cards; then
+    cull answers each report: one "yes" for every close offer, then a card per keep, bundled
+    question or plain reply, until the tab closes itself or you leave it. Tabs that already
+    end on an unanswered `/close` report join without being sent anything.
   - `loops` finds closed sessions whose next step went nowhere, clears the ones a later
     session resolved, and walks the rest. `review --since 7d` groups closes by disposition.
   - Model runs go through `claude -p` (`HERDR_CULL_MODEL`), persisted under

@@ -558,5 +558,184 @@ class CloseSelf(unittest.TestCase):
                 self.close(safe=True)
 
 
+OFFER = """**Verdict:** close as filed
+**Outcome:** reviewed #55011
+**Next step:** merge after the gate
+**Open items:**
+- [manual] action_left — merge decision (yours)
+- [fail] uncommitted — 3 commits unpushed (git log @{u}..)
+
+    herdr-sort close --as filed --ref GROWTH-66 --note "#55011 green; waits on gate" --yes --self
+
+Want me to run it?"""
+
+
+def transcript(path, *turns):
+    """turns: (type, text, iso timestamp); written as Claude transcript lines."""
+    import json
+    with open(path, "w") as handle:
+        for kind, text, stamp in turns:
+            content = text if "user" == kind else [{"type": "text", "text": text}]
+            handle.write(json.dumps({"type": kind, "timestamp": stamp,
+                                     "message": {"content": content}}) + "\n")
+
+
+class CloseReport(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+
+    def test_offer_parses_command_disposition_note_and_fail_first(self):
+        rep = self.cli._report(OFFER)
+        self.assertEqual("offer", rep["kind"])
+        self.assertEqual("filed", rep["disposition"])
+        self.assertEqual("#55011 green; waits on gate", rep["note"])
+        self.assertTrue(rep["command"].endswith("--yes --self"))
+        self.assertEqual("fail", rep["items"][0][0])
+        self.assertIsNone(rep["side"])
+
+    def test_keep_wordings_are_keeps_even_with_a_prebuilt_command(self):
+        for line in ("keep — 2 blocking", "keep, with 1 item blocking", "don't close yet."):
+            text = f"**Verdict:** {line}\n\n    herdr-sort close --as filed --yes --self\n"
+            self.assertEqual("keep", self.cli._report(text)["kind"], line)
+
+    def test_a_bundled_question_is_flagged(self):
+        text = OFFER.replace("Want me to run it?", "Should I run that? Before closing, tell me "
+                             "if you'd also like GROWTH-85 cancelled or the worktree removed.")
+        self.assertIn("GROWTH-85", self.cli._report(text)["side"])
+
+    def test_pick_reads_all_ranges_and_refuses_junk(self):
+        self.assertEqual([1, 2, 3], self.cli._pick("y", 3))
+        self.assertEqual([1, 2, 4], self.cli._pick("1-2 4 9", 5))
+        self.assertEqual([], self.cli._pick("", 3))
+        self.assertEqual([], self.cli._pick("maybe", 3))
+
+    def test_review_verdicts_are_not_close_reports(self):
+        self.assertIsNone(self.cli.REPORT_VERDICT.search("**Verdict:** CONFIRMED"))
+
+    def test_tail_reply_returns_last_assistant_text_and_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.jsonl")
+            transcript(path, ("assistant", "earlier", "2026-10-08T10:00:00Z"),
+                       ("user", "/close", "2026-10-08T10:01:00Z"),
+                       ("assistant", OFFER, "2026-10-08T10:02:00Z"))
+            text, stamp = self.cli._tail_reply(path)
+        self.assertEqual(OFFER, text)
+        self.assertEqual(ledger._ts("2026-10-08T10:02:00Z"), stamp)
+
+
+class CloseCandidates(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def tab(self, pane, reply="All set.", recfields=None, **fields):
+        path = os.path.join(self.tmp.name, f"{pane}.jsonl")
+        transcript(path, ("assistant", reply, "2026-10-08T10:00:00Z"))
+        return row(pane, pane, rec=rec(pane, file=path, **(recfields or {})), **fields)
+
+    def test_pending_report_vs_sendable_vs_skipped(self):
+        rows = [self.tab("pending", OFFER, verdict="GLANCE"),
+                self.tab("send"),
+                self.tab("glance", verdict="GLANCE"),
+                self.tab("busy", status="working"),
+                self.tab("here", focused=True),
+                self.tab("codex", agent="codex"),
+                self.tab("trivial", recfields={"tool_calls": 0})]
+        pending, sendable = self.cli._close_candidates(rows)
+        self.assertEqual(["pending"], [i["pane_id"] for i in pending])
+        self.assertEqual("ready", pending[0]["state"])
+        self.assertEqual(["send"], [r["pane_id"] for r in sendable])
+
+
+class UsherPoll(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "s.jsonl")
+        transcript(self.path, ("assistant", "old reply", "2026-10-08T10:00:00Z"))
+        self.item = self.cli._usher_item(row("p1", "k1", rec=rec("k1", file=self.path)))
+        self.item["sent_at"] = ledger._ts("2026-10-08T10:01:00Z")
+
+    def poll(self, panes, now="2026-10-08T10:01:10Z"):
+        snap = {"snapshot": {"panes": panes}}
+        with mock.patch.object(self.cli.ledger, "call", return_value=snap), \
+                mock.patch.object(self.cli.time, "time", return_value=ledger._ts(now)):
+            self.cli._usher_poll([self.item])
+
+    def test_a_gone_pane_closed_itself(self):
+        self.poll([])
+        self.assertEqual("closed", self.item["state"])
+
+    def test_ready_only_after_a_new_reply_and_two_idle_polls(self):
+        idle = [{"pane_id": "p1", "agent_status": "idle"}]
+        self.poll(idle)
+        self.assertEqual("waiting", self.item["state"])
+        transcript(self.path, ("assistant", OFFER, "2026-10-08T10:01:30Z"))
+        self.poll(idle)
+        self.assertEqual("waiting", self.item["state"])
+        self.poll(idle)
+        self.assertEqual(("ready", OFFER), (self.item["state"], self.item["reply"]))
+
+    def test_working_resets_the_idle_count(self):
+        transcript(self.path, ("assistant", "step one", "2026-10-08T10:01:30Z"))
+        self.poll([{"pane_id": "p1", "agent_status": "idle"}])
+        self.poll([{"pane_id": "p1", "agent_status": "working"}])
+        self.poll([{"pane_id": "p1", "agent_status": "idle"}])
+        self.assertEqual("waiting", self.item["state"])
+
+    def test_blocked_is_ready_at_once(self):
+        self.poll([{"pane_id": "p1", "agent_status": "blocked"}])
+        self.assertTrue(self.item["blocked"])
+        self.assertEqual("ready", self.item["state"])
+
+    def test_a_prompt_that_never_started_is_stalled(self):
+        self.poll([{"pane_id": "p1", "agent_status": "idle"}], now="2026-10-08T10:02:00Z")
+        self.assertTrue(self.item["stalled"])
+
+
+class UsherWalk(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+        self.said = []
+
+        def say(item, text, closing=False):
+            self.said.append((item["pane_id"], text))
+            item["state"] = "closed" if closing else "left"
+            return True
+
+        for name, fake in (("_usher_poll", lambda items: None), ("_say", say)):
+            patch = mock.patch.object(self.cli, name, side_effect=fake)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def item(self, pane, reply):
+        return self.cli._usher_item(row(pane, pane, rec=rec(pane, file="/nope")), reply, NOW)
+
+    def test_yes_to_all_offers_in_one_answer(self):
+        items = [self.item("a", OFFER), self.item("b", OFFER)]
+        with mock.patch.object(self.cli, "_yes", return_value=True), \
+                mock.patch("builtins.print"):
+            self.cli._usher(items, popup=False)
+        self.assertEqual([("a", "yes"), ("b", "yes")], self.said)
+
+    def test_keep_y_asks_for_the_work_and_a_fresh_report(self):
+        items = [self.item("a", "**Verdict:** keep — 1 blocking\n\nShall I post it?")]
+        with mock.patch.object(self.cli, "_key", return_value="y"), \
+                mock.patch("builtins.print"):
+            self.cli._usher(items, popup=False)
+        self.assertEqual([("a", self.cli.SAY_DO_IT)], self.said)
+
+    def test_declined_batch_walks_each_and_k_leaves_it_unsaid(self):
+        items = [self.item("a", OFFER), self.item("b", OFFER)]
+        with mock.patch.object(self.cli, "_yes", return_value=False), \
+                mock.patch.object(self.cli, "_key", side_effect=["k", "y"]), \
+                mock.patch("builtins.print"):
+            self.cli._usher(items, popup=False)
+        self.assertEqual("left", items[0]["state"])
+        self.assertEqual([("b", "yes")], self.said)
+
+
 if __name__ == "__main__":
     unittest.main()
