@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""herdr-keys -- how often each herdr keybinding gets used.
+
+  run KEY -- CMD...    log KEY, then exec CMD (wrap a [[keys.command]] with this)
+  watch                log built-in actions inferred from the event stream (detaches)
+  watch --foreground   same, attached
+  stop                 stop the watcher
+  reset                clear the log; stats, culling included, counts from now
+  stats [--since 7d]   counts per binding, never-used custom bindings, inferred actions
+
+Custom bindings are exact counts. Built-in actions (tab/space/pane switches, splits,
+closes, zoom/resize) come from herdr events, which also fire for mouse clicks and API
+calls, so those counts are an upper bound on key use.
+"""
+
+import collections
+import datetime
+import fcntl
+import json
+import os
+import re
+import select
+import socket
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/herdr-keys")
+LOG_PATH = os.path.join(STATE_DIR, "keys.jsonl")
+LOCK_PATH = os.path.join(STATE_DIR, "watch.lock")
+CONFIG_PATH = os.path.expanduser("~/.config/herdr/config.toml")
+SORT_LOG = os.path.expanduser("~/.local/state/herdr-sort/sort.log")
+SORT_CLOSES = os.path.expanduser("~/.local/state/herdr-sort/closes.jsonl")
+
+EVENT_TYPES = ["workspace.focused", "tab.focused", "pane.focused", "tab.created",
+               "tab.closed", "pane.created", "pane.closed", "layout.updated"]
+BURST_S = 0.2
+# Events this soon after a logged custom keypress are that binding's side effects
+# (popups opening, compose splits), not separate built-in actions.
+KEY_SHADOW_S = 1.5
+
+
+def append(record):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    record["ts"] = round(time.time(), 3)
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def run(argv):
+    if len(argv) < 2 or "--" not in argv:
+        raise SystemExit("usage: herdr-keys run KEY -- CMD...")
+    key, cmd = argv[0], argv[argv.index("--") + 1:]
+    if not cmd:
+        raise SystemExit("herdr-keys run: no command after --")
+    # Fail-open: a logging failure must never cost the binding its action.
+    try:
+        append({"kind": "key", "key": key,
+                "pane": os.environ.get("HERDR_ACTIVE_PANE_ID")})
+    except Exception:
+        pass
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as err:
+        raise SystemExit(f"herdr-keys run: {cmd[0]}: {err.strerror}")
+
+
+def subscribe():
+    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser(
+        "~/.config/herdr/herdr.sock")
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(path)
+    payload = {"id": "herdr-keys", "method": "events.subscribe",
+               "params": {"subscriptions": [{"type": t} for t in EVENT_TYPES]}}
+    conn.sendall(json.dumps(payload).encode() + b"\n")
+    return conn
+
+
+class Reader:
+    """Line reader over the event socket; the buffer outlives each read."""
+
+    def __init__(self, conn):
+        self.conn, self.buf, self.lines = conn, b"", collections.deque()
+
+    def next(self, timeout):
+        """The next parsed line; None after `timeout` seconds of silence; EOFError at EOF."""
+        while not self.lines:
+            ready, _, _ = select.select([self.conn], [], [], timeout)
+            if not ready:
+                return None
+            chunk = self.conn.recv(65536)
+            if not chunk:
+                raise EOFError
+            self.buf += chunk
+            *complete, self.buf = self.buf.split(b"\n")
+            self.lines.extend(json.loads(line) for line in complete if line.strip())
+        return self.lines.popleft()
+
+
+class Focus:
+    def __init__(self):
+        self.workspace = self.tab = self.pane = None
+        self.tool_panes = set()
+        self.last_key = 0.0
+
+    def classify(self, burst):
+        """One user action fans out into several events; name the action once."""
+        kinds = collections.Counter(e["event"] for e in burst)
+        before = (self.workspace, self.tab, self.pane)
+        closed = {e["data"].get("pane_id") for e in burst if e["event"] == "pane_closed"}
+        for event in burst:
+            data = event["data"]
+            if event["event"] == "workspace_focused":
+                self.workspace = data.get("workspace_id")
+            elif event["event"] == "tab_focused":
+                self.tab = data.get("tab_id")
+            elif event["event"] == "pane_focused":
+                self.pane = data.get("pane_id")
+        if kinds["tab_created"]:
+            return "tab_created"
+        if kinds["tab_closed"]:
+            closed_tabs = {e["data"].get("tab_id") for e in burst if e["event"] == "tab_closed"}
+            return "tab_closed" if before[1] in closed_tabs else None
+        if kinds["pane_created"]:
+            return "pane_created"
+        if kinds["pane_closed"]:
+            # Background closes (agents exiting, tooling reaping panes) hit unfocused
+            # panes; popups and compose splits closing are a binding's side effect.
+            if before[2] not in closed or closed & self.tool_panes:
+                return None
+            return "pane_closed"
+        if self.workspace != before[0]:
+            return "workspace_switch"
+        if self.tab != before[1]:
+            return "tab_switch"
+        if self.pane != before[2]:
+            return "pane_focus"
+        if kinds["layout_updated"]:
+            return "layout_change"
+        return None
+
+
+def last_key_ts():
+    try:
+        with open(LOG_PATH, "rb") as handle:
+            handle.seek(max(0, os.path.getsize(LOG_PATH) - 8192))
+            tail = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return 0.0
+    for line in reversed(tail):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("kind") == "key":
+            return record["ts"]
+    return 0.0
+
+
+def drain(reader, timeout):
+    """Events until `timeout` seconds pass with nothing new."""
+    events = []
+    while (line := reader.next(timeout)) is not None:
+        if "error" in line:
+            raise SystemExit(f"herdr-keys: subscribe failed: {line['error']}")
+        if "event" in line:
+            events.append(line)
+    return events
+
+
+def watch_once(focus):
+    conn = subscribe()
+    reader = Reader(conn)
+    try:
+        # The stream replays a backlog on connect, untimestamped. Replay it into the
+        # focus state without logging: counting it would double-count every reconnect.
+        focus.classify(drain(reader, 0.3))
+        while True:
+            first = reader.next(None)
+            if "event" not in first:
+                continue
+            burst = [first] + drain(reader, BURST_S)
+            shadowed = time.time() - last_key_ts() < KEY_SHADOW_S
+            if shadowed:
+                focus.tool_panes.update(e["data"].get("pane_id") for e in burst
+                                        if e["event"] == "pane_created")
+            action = focus.classify(burst)
+            if action and not shadowed:
+                append({"kind": "event", "action": action,
+                        "events": sorted({e["event"] for e in burst})})
+    except EOFError:
+        return
+    finally:
+        conn.close()
+
+
+def watch(argv):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK_PATH, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    if "--foreground" not in argv:
+        # Plugin startup commands must return; the watcher must outlive them.
+        if os.fork():
+            return 0
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    focus = Focus()
+    while True:
+        try:
+            watch_once(focus)
+        except (OSError, ValueError):
+            pass
+        # The stream ends when the server restarts; back off, do not spin.
+        time.sleep(5)
+
+
+def stop(_argv):
+    try:
+        with open(LOCK_PATH) as handle:
+            pid = int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+    if not pid:
+        print("herdr-keys: no watcher running")
+        return 0
+    try:
+        os.kill(pid, 15)
+        print(f"herdr-keys: stopped watcher {pid}")
+    except ProcessLookupError:
+        print("herdr-keys: no watcher running")
+    return 0
+
+
+def configured_bindings():
+    """[(key, label)] for each [[keys.command]] in config.toml."""
+    try:
+        text = open(CONFIG_PATH, encoding="utf-8").read()
+    except OSError:
+        return []
+    out = []
+    for block in text.split("[[keys.command]]")[1:]:
+        key = re.search(r'^key\s*=\s*"([^"]+)"\s*(?:#\s*(.*))?$', block, re.M)
+        cmd = re.search(r'^command\s*=\s*"([^"]+)"', block, re.M)
+        if not key:
+            continue
+        label = key.group(2) or ""
+        if not label and cmd:
+            parts = cmd.group(1).split()
+            if parts and parts[0].endswith("herdr-keys") and "--" in parts:
+                parts = parts[parts.index("--") + 1:]
+            label = " ".join([os.path.basename(parts[0])] + parts[1:]) if parts else ""
+        wrapped = bool(cmd and "herdr-keys run" in cmd.group(1))
+        out.append((key.group(1), label.strip(), wrapped))
+    return out
+
+
+def parse_since(value):
+    match = re.fullmatch(r"(\d+)([hdw])", value)
+    if not match:
+        raise SystemExit("herdr-keys: --since takes e.g. 12h, 7d, 2w")
+    hours = {"h": 1, "d": 24, "w": 168}[match.group(2)] * int(match.group(1))
+    return time.time() - hours * 3600
+
+
+def ago(ts):
+    secs = time.time() - ts
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit} ago"
+    return "just now"
+
+
+def cull_report(since):
+    """Culling from herdr-sort's own records: its log and the close ledger are exact."""
+    sessions, outside, start = [], 0, None
+    try:
+        lines = open(SORT_LOG, encoding="utf-8").read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            ts = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if ts < since:
+            continue
+        message = line[20:]
+        if message.startswith("cull start"):
+            start = ts
+        elif (match := re.match(r"cull closed (\d+) tabs(?:; /close: (.*))?", message)):
+            usher = {name: int(n) for n, name in
+                     re.findall(r"(\d+) ([a-z ]+?)(?=;|$)", match.group(2) or "")}
+            sessions.append({"end": ts, "start": start, "cards": int(match.group(1)),
+                             "self": usher.get("closed themselves", 0),
+                             "left": usher.get("left open", 0)})
+            start = None
+        elif (match := re.match(r"closed (\d+) tabs", message)):
+            outside += int(match.group(1))
+    dispositions = collections.Counter()
+    try:
+        with open(SORT_CLOSES, encoding="utf-8") as handle:
+            for line in handle:
+                record = json.loads(line)
+                if record.get("closed_at", 0) >= since:
+                    dispositions[record.get("disposition") or "none"] += 1
+    except (OSError, ValueError):
+        pass
+
+    print("\nCulling (herdr-sort; exact)")
+    if not sessions and not outside:
+        print("  no culls or closes in this window")
+        return
+    for s in sessions:
+        when = datetime.datetime.fromtimestamp(s["end"]).strftime("%m-%d %H:%M")
+        took = f"{int((s['end'] - s['start']) // 60)}m" if s["start"] else "?"
+        detail = f"{s['cards']} by card"
+        if s["self"] or s["left"]:
+            detail += f", {s['self']} closed themselves via /close, {s['left']} left open"
+        print(f"  {when}  {took:>4}  {s['cards'] + s['self']:>3} closed  ({detail})")
+    print(f"  {len(sessions)} cull session{'s' if len(sessions) != 1 else ''}, "
+          f"{sum(s['cards'] + s['self'] for s in sessions)} tabs closed in them; "
+          f"{outside} closed outside a cull")
+    if dispositions:
+        print("  dispositions: " + " · ".join(f"{d} {n}" for d, n in dispositions.most_common()))
+
+
+def reset(_argv):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_PATH, "w", encoding="utf-8"):
+        pass
+    append({"kind": "reset"})
+    print("herdr-keys: log cleared; counting from now")
+    return 0
+
+
+def stats(argv):
+    since = parse_since(argv[argv.index("--since") + 1]) if "--since" in argv else 0
+    keys, actions, last = collections.Counter(), collections.Counter(), {}
+    first = None
+    try:
+        with open(LOG_PATH, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("kind") == "reset":
+                    # herdr-sort's logs are never cleared (the ledger backs reopen),
+                    # so the culling section is cut at the reset instead.
+                    since = max(since, record["ts"])
+                    keys.clear(), actions.clear(), last.clear()
+                    first = None
+                if record["ts"] < since:
+                    continue
+                first = first or record["ts"]
+                if record.get("kind") == "key":
+                    keys[record["key"]] += 1
+                    last[record["key"]] = record["ts"]
+                elif record.get("kind") == "event":
+                    actions[record["action"]] += 1
+    except FileNotFoundError:
+        pass
+    if first is None:
+        print("herdr-keys: nothing logged in that window yet")
+    else:
+        span = datetime.datetime.fromtimestamp(first).strftime("%Y-%m-%d %H:%M")
+        print(f"since {span}\n")
+
+    bindings = configured_bindings()
+    print("Custom bindings (exact)")
+    seen = set()
+    for key, label, wrapped in sorted(bindings, key=lambda b: -keys[b[0]]):
+        seen.add(key)
+        note = ago(last[key]) if key in last else ("never" if wrapped else "not wrapped")
+        print(f"  {keys[key]:>5}  {key:<16} {label[:36]:<36} {note}")
+    for key in sorted(set(keys) - seen, key=lambda k: -keys[k]):
+        print(f"  {keys[key]:>5}  {key:<16} {'(no longer in config.toml)':<36} {ago(last[key])}")
+
+    print("\nBuilt-in actions (inferred from events; includes mouse and API)")
+    labels = {"tab_switch": "switch tab", "workspace_switch": "switch space",
+              "pane_focus": "focus pane", "pane_created": "split / new pane",
+              "pane_closed": "close pane", "tab_created": "new tab",
+              "tab_closed": "close tab", "layout_change": "zoom / resize / swap"}
+    for action, label in sorted(labels.items(), key=lambda a: -actions[a[0]]):
+        print(f"  {actions[action]:>5}  {label}")
+    cull_report(since)
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    commands = {"run": run, "watch": watch, "stop": stop, "reset": reset, "stats": stats}
+    if argv[1] not in commands:
+        raise SystemExit(f"herdr-keys: unknown command {argv[1]!r} (see --help)")
+    return commands[argv[1]](argv[2:]) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

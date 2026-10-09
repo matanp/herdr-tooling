@@ -8,6 +8,9 @@ show_agent_labels_on_pane_borders = true
 # this must stay pinned even though it matches the default.
 prefix = "ctrl+b"
 
+# Every [[keys.command]] runs through `herdr-keys run KEY --`, which logs the press
+# for `herdr-keys stats`. A binding added without the wrapper still works, uncounted.
+
 # ccnav-herdr — turn navigation. Failures toast; trail in
 # ~/.local/state/ccnav-herdr/nav.log.  Revert by deleting these blocks and
 # reloading (`herdr server reload-config`), not with `config reset-keys`.
@@ -15,22 +18,22 @@ prefix = "ctrl+b"
 [[keys.command]]
 key = "prefix+u"           # previous turn
 type = "shell"
-command = "~/.local/bin/herdr-compose nav prev"
+command = "~/.local/bin/herdr-keys run prefix+u -- ~/.local/bin/herdr-compose nav prev"
 
 [[keys.command]]
 key = "prefix+d"           # next turn
 type = "shell"
-command = "~/.local/bin/herdr-compose nav next"
+command = "~/.local/bin/herdr-keys run prefix+d -- ~/.local/bin/herdr-compose nav next"
 
 [[keys.command]]
 key = "prefix+f"           # newest turn
 type = "shell"
-command = "~/.local/bin/herdr-compose nav newest"
+command = "~/.local/bin/herdr-keys run prefix+f -- ~/.local/bin/herdr-compose nav newest"
 
 [[keys.command]]
 key = "prefix+a"           # back to the live tail
 type = "shell"
-command = "~/.local/bin/herdr-compose nav bottom"
+command = "~/.local/bin/herdr-keys run prefix+a -- ~/.local/bin/herdr-compose nav bottom"
 
 [theme]
 name = "solarized"
@@ -45,7 +48,7 @@ delivery = "off"
 [[keys.command]]
 key = "prefix+shift+s"
 type = "shell"
-command = "~/.local/bin/herdr-space-scope toggle"
+command = "~/.local/bin/herdr-keys run prefix+shift+s -- ~/.local/bin/herdr-space-scope toggle"
 
 # herdr-dash plugin — floating dashboard: agents, memory by pane, notes,
 # prefix cheat-sheet, MEMORY.md index health. Popup is not reachable from the
@@ -55,7 +58,7 @@ command = "~/.local/bin/herdr-space-scope toggle"
 [[keys.command]]
 key = "prefix+m"           # dashboard popup
 type = "shell"
-command = "~/.local/share/herdr-plugins/herdr-dash/run popup"
+command = "~/.local/bin/herdr-keys run prefix+m -- ~/.local/share/herdr-plugins/herdr-dash/run popup"
 
 # viewer plugin — floating file picker with Markdown/code preview over the
 # focused pane's cwd. Revert by deleting this block and reloading
@@ -64,12 +67,12 @@ command = "~/.local/share/herdr-plugins/herdr-dash/run popup"
 [[keys.command]]
 key = "prefix+shift+v"     # file viewer popup
 type = "shell"
-command = "~/.local/share/herdr-plugins/viewer/view popup"
+command = "~/.local/bin/herdr-keys run prefix+shift+v -- ~/.local/share/herdr-plugins/viewer/view popup"
 
 [[keys.command]]
 key = "prefix+y"           # file viewer in copy mode: enter copies contents
 type = "shell"
-command = "~/.local/share/herdr-plugins/viewer/view copy"
+command = "~/.local/bin/herdr-keys run prefix+y -- ~/.local/share/herdr-plugins/viewer/view copy"
 
 # herdr-compose — nvim split under the agent for writing the next prompt;
 # <C-s> in nvim sends it. The ccnav bindings above go through `herdr-compose
@@ -79,14 +82,14 @@ command = "~/.local/share/herdr-plugins/viewer/view copy"
 [[keys.command]]
 key = "prefix+i"           # open/close compose split
 type = "shell"
-command = "~/.local/bin/herdr-compose toggle"
+command = "~/.local/bin/herdr-keys run prefix+i -- ~/.local/bin/herdr-compose toggle"
 
 [[keys.command]]
 key = "prefix+shift+k"     # scroll agent up half a page
 type = "shell"
-command = "~/.local/bin/herdr-compose scroll up"
+command = "~/.local/bin/herdr-keys run prefix+shift+k -- ~/.local/bin/herdr-compose scroll up"
 
 [[keys.command]]
 key = "prefix+shift+j"     # scroll agent down half a page
 type = "shell"
-command = "~/.local/bin/herdr-compose scroll down"
+command = "~/.local/bin/herdr-keys run prefix+shift+j -- ~/.local/bin/herdr-compose scroll down"

@@ -11,6 +11,7 @@ Nothing here installs itself. Copy or symlink each piece to the location herdr a
 |---|---|
 | `bin/*` | `~/.local/bin/` |
 | `plugins/<name>/` | `~/.local/share/herdr-plugins/<name>/`, then `herdr plugin link <dir>` |
+| `bin/herdr-keys` | `~/.local/bin/herdr-keys` (symlink) |
 | `plugins/space-scope/space-scope` | also symlinked as `~/.local/bin/herdr-space-scope` |
 | `compose/compose.lua` | `~/.local/share/herdr-compose/compose.lua` |
 | `config/config.toml` | `~/.config/herdr/config.toml` |
@@ -45,6 +46,11 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
     close notes are cached in `notes.json`, keyed by transcript size.
 - **`herdr-compose`** — `prefix+i`: nvim split under the agent for the next prompt,
   `Ctrl-S` sends. `prefix+shift+k/j` scroll the agent.
+- **`herdr-keys`** — keybinding usage. `stats [--since 7d]`: per-binding counts, never-used
+  custom bindings, and built-in actions (tab/space/pane switches, splits, closes, zoom).
+  - Custom bindings are exact: each `[[keys.command]]` runs `herdr-keys run KEY -- CMD`.
+  - Built-ins are inferred from the event stream by the `herdr-keys` plugin's startup
+    watcher, so mouse and API calls count too. Log in `~/.local/state/herdr-keys/keys.jsonl`.
 - **`ccnav-herdr`** — turn navigation, `prefix+u/d/f/a` (prev / next / newest / bottom),
   routed via `herdr-compose nav`.
 

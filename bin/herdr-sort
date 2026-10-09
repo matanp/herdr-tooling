@@ -1784,6 +1784,7 @@ def cmd_cull(args, rest):
         if not rows:
             print("no open tabs")
             return 0
+        log(f"cull start: {len(rows)} open tabs")
         ushered = _offer_close(rows)
         skip = {i["pane_id"] for i in ushered}
         cards, linear, llm = _assess([r for r in rows if r["pane_id"] not in skip], index, [])

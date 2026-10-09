@@ -1,0 +1,3 @@
+#!/bin/sh
+# Plugin entry point: herdr runs plugin commands from the plugin root.
+exec "$HOME/.local/bin/herdr-keys" "$@"
