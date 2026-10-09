@@ -15,10 +15,11 @@ import time
 from . import agents as agents_mod
 from . import keys as keys_mod
 from . import notes as notes_mod
+from . import reports as reports_mod
 
 GIB = 1024 ** 3
-SECTIONS = ("usage", "tabs", "memory", "worktrees", "index", "agents", "keys", "notes")
-TITLES = {"usage": "USAGE", "tabs": "TABS", "memory": "MEMORY", "worktrees": "WORKTREES",
+SECTIONS = ("reports", "usage", "tabs", "memory", "worktrees", "index", "agents", "keys", "notes")
+TITLES = {"reports": "REPORTS", "usage": "USAGE", "tabs": "TABS", "memory": "MEMORY", "worktrees": "WORKTREES",
           "index": "MEMORY.md INDEX", "agents": "AGENTS", "keys": "PREFIX",
           "notes": "NOTES"}
 
@@ -354,6 +355,66 @@ def tabs(model, width, out):
             out.append(Line(_clip(f"       {row['next']}", width), "dim"))
 
 
+def _report_tag(item):
+    rep = item["report"]
+    if item["blocked"]:
+        return "blocked", "crit"
+    if item["stalled"]:
+        return "stalled", "warn"
+    if item["told_yes"] and "offer" == rep["kind"]:
+        return "not shut", "warn"
+    if "offer" == rep["kind"]:
+        return rep["disposition"] or "close", "ok" if reports_mod.herdr_close.clean_offer(rep) \
+            else "warn"
+    return rep["kind"], "warn"
+
+
+def _report_detail(item):
+    rep = item["report"]
+    fails = sum("fail" == r.lower() for r, _ in rep["items"])
+    if "reply" == rep["kind"]:
+        lines = [l for l in (item["reply"] or "").strip().splitlines() if l.strip()]
+        text = lines[-1].strip() if lines else "(no reply)"
+    elif "keep" == rep["kind"]:
+        text = "wants: " + (rep["ask"] or (rep["items"][0][1] if rep["items"] else "?"))
+    else:
+        text = "next: " + (rep["next"] or "?")
+    if rep["side"]:
+        text += "  · also asks something"
+    return text + (f"  · {fails} FAIL" if fails else "")
+
+
+def reports(model, width, out):
+    data = model.get("reports")
+    if not isinstance(data, dict):
+        out.append(_header("reports", "batch /close", width, model.get("_number")))
+        out.append(Line(f"  {data}" if data else "  collecting…", "crit" if data else "dim"))
+        return
+    items, checking = data["items"], data["checking"]
+    tally = {}
+    for item in items:
+        tally[item["report"]["kind"]] = tally.get(item["report"]["kind"], 0) + 1
+    right = " · ".join(f"{n} {k}{'s' if n > 1 else ''}" for k, n in tally.items())
+    right = " · ".join(p for p in (right, f"{len(checking)} working" if checking else "") if p)
+    out.append(_header("reports", right or "nothing waiting", width, model.get("_number")))
+    for item in items[:8] if model.get("_brief") else items:
+        tag, style = _report_tag(item)
+        out.append(Line(_clip(f"  {tag:<8} {_clip(item['title'], 34):<34}  "
+                              f"{_report_detail(item)}", width), style,
+                        target=("report", item)))
+    if model.get("_brief") and len(items) > 8:
+        out.append(Line(f"  … {len(items) - 8} more (enter walks them all)", "dim"))
+    if checking:
+        out.append(Line(_clip("  working: " + ", ".join(_clip(c["title"], 24)
+                                                     for c in checking), width), "dim"))
+    clean = sum(reports_mod.herdr_close.clean_offer(i["report"]) and not i["told_yes"]
+                for i in items)
+    if items:
+        out.append(Line("  enter answers them one by one"
+                        + (f" · Y says yes to the {clean} clean offers" if clean > 1 else ""),
+                        "dim"))
+
+
 def _tokens(value):
     for unit, size in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
         if value >= size:
@@ -401,7 +462,7 @@ def usage(model, width, out):
         out.append(Line(_clip("  today on   " + ", ".join(models), width), "dim"))
 
 
-RENDERERS = {"usage": usage, "tabs": tabs, "memory": memory, "worktrees": worktrees, "index": index,
+RENDERERS = {"reports": reports, "usage": usage, "tabs": tabs, "memory": memory, "worktrees": worktrees, "index": index,
              "agents": agents, "keys": keys, "notes": notes}
 
 

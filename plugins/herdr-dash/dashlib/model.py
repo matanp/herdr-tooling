@@ -13,6 +13,7 @@ from . import keys as keys_mod
 from . import memdoc
 from . import notes as notes_mod
 from . import procmem
+from . import reports as reports_mod
 from . import worktrees as worktrees_mod
 from . import tabs as tabs_mod
 from . import usage as usage_mod
@@ -25,8 +26,8 @@ def _safe(fn, *args):
         return f"{type(err).__name__}: {err}"
 
 
-def _herdr_side():
-    """Snapshot, agents and the pane->workspace join, which share one server."""
+def _herdr_side(want_reports=False):
+    """Snapshot, agents, reports and the pane->workspace join, which share one server."""
     try:
         snap = herdr_mod.snapshot()
     except Exception as err:
@@ -34,7 +35,8 @@ def _herdr_side():
         # server makes every live pane look orphaned -- the loudest possible
         # wrong answer -- so the band must fail closed, not open.
         return {"agents": f"{type(err).__name__}: {err}", "pane_workspace": {},
-                "terminal_titles": {}, "terminals": {}, "panes_known": False}
+                "terminal_titles": {}, "terminals": {}, "panes_known": False,
+                "reports": f"{type(err).__name__}: {err}"}
     panes, terminals = herdr_mod.pane_index(snap)
     spaces = herdr_mod.workspace_labels(snap)
     pane_workspace = {pane_id: spaces.get(pane.get("workspace_id"), "")
@@ -49,12 +51,13 @@ def _herdr_side():
                   for row in rows if row.get("terminal_id")}
     return {"agents": rows, "pane_workspace": pane_workspace,
             "terminal_titles": titles, "terminals": terminals,
-            "panes_known": True}
+            "panes_known": True,
+            "reports": _safe(reports_mod.collect, snap) if want_reports else None}
 
 
 def collect(sections=None):
-    wanted = set(sections or ("usage", "tabs", "memory", "worktrees", "index", "agents",
-                              "keys", "notes"))
+    wanted = set(sections or ("reports", "usage", "tabs", "memory", "worktrees", "index",
+                              "agents", "keys", "notes"))
     model = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         jobs = {}
@@ -72,8 +75,8 @@ def collect(sections=None):
             jobs["tabs"] = pool.submit(_safe, tabs_mod.view)
         # Agents needs the snapshot, and the memory section wants its workspace
         # labels, so it runs whenever either is asked for.
-        if {"agents", "memory", "notes"} & wanted:
-            jobs["_herdr"] = pool.submit(_herdr_side)
+        if {"agents", "memory", "notes", "reports"} & wanted:
+            jobs["_herdr"] = pool.submit(_herdr_side, "reports" in wanted)
         for name, job in jobs.items():
             value = job.result()
             if "_herdr" == name:

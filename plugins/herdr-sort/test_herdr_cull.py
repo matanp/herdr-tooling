@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import herdr_close
 import herdr_cull as cull
 import herdr_ledger as ledger
 
@@ -581,36 +582,35 @@ def transcript(path, *turns):
 
 
 class CloseReport(unittest.TestCase):
-    def setUp(self):
-        self.cli = load_cli()
-
-    def test_offer_parses_command_disposition_note_and_fail_first(self):
-        rep = self.cli._report(OFFER)
+    def test_offer_parses_command_disposition_next_and_fail_first(self):
+        rep = herdr_close.report(OFFER)
         self.assertEqual("offer", rep["kind"])
         self.assertEqual("filed", rep["disposition"])
-        self.assertEqual("#55011 green; waits on gate", rep["note"])
+        self.assertEqual("merge after the gate", rep["next"])
         self.assertTrue(rep["command"].endswith("--yes --self"))
         self.assertEqual("fail", rep["items"][0][0])
-        self.assertIsNone(rep["side"])
+        self.assertTrue(herdr_close.clean_offer(rep))
 
     def test_keep_wordings_are_keeps_even_with_a_prebuilt_command(self):
         for line in ("keep — 2 blocking", "keep, with 1 item blocking", "don't close yet."):
             text = f"**Verdict:** {line}\n\n    herdr-sort close --as filed --yes --self\n"
-            self.assertEqual("keep", self.cli._report(text)["kind"], line)
+            self.assertEqual("keep", herdr_close.report(text)["kind"], line)
 
-    def test_a_bundled_question_is_flagged(self):
+    def test_a_bundled_question_is_not_a_clean_offer(self):
         text = OFFER.replace("Want me to run it?", "Should I run that? Before closing, tell me "
                              "if you'd also like GROWTH-85 cancelled or the worktree removed.")
-        self.assertIn("GROWTH-85", self.cli._report(text)["side"])
+        rep = herdr_close.report(text)
+        self.assertIn("GROWTH-85", rep["side"])
+        self.assertFalse(herdr_close.clean_offer(rep))
 
-    def test_pick_reads_all_ranges_and_refuses_junk(self):
-        self.assertEqual([1, 2, 3], self.cli._pick("y", 3))
-        self.assertEqual([1, 2, 4], self.cli._pick("1-2 4 9", 5))
-        self.assertEqual([], self.cli._pick("", 3))
-        self.assertEqual([], self.cli._pick("maybe", 3))
+    def test_a_keeps_ask_is_its_proposal_not_a_report_field(self):
+        text = ("**Verdict:** keep — 1 blocking\n**Next step:** post it\n"
+                "- [fail] action_left — GROWTH-287 comment unposted\n\n"
+                "Shall I post the comment?\n\n**Resume:** claude --resume abc")
+        self.assertEqual("Shall I post the comment?", herdr_close.report(text)["ask"])
 
     def test_review_verdicts_are_not_close_reports(self):
-        self.assertIsNone(self.cli.REPORT_VERDICT.search("**Verdict:** CONFIRMED"))
+        self.assertIsNone(herdr_close.REPORT_VERDICT.search("**Verdict:** CONFIRMED"))
 
     def test_tail_reply_returns_last_assistant_text_and_time(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,9 +618,79 @@ class CloseReport(unittest.TestCase):
             transcript(path, ("assistant", "earlier", "2026-10-08T10:00:00Z"),
                        ("user", "/close", "2026-10-08T10:01:00Z"),
                        ("assistant", OFFER, "2026-10-08T10:02:00Z"))
-            text, stamp = self.cli._tail_reply(path)
+            text, stamp = herdr_close.tail_reply(path)
         self.assertEqual(OFFER, text)
         self.assertEqual(ledger._ts("2026-10-08T10:02:00Z"), stamp)
+
+    def test_pick_reads_all_ranges_and_refuses_junk(self):
+        cli = load_cli()
+        self.assertEqual([1, 2, 3], cli._pick("y", 3))
+        self.assertEqual([1, 2, 4], cli._pick("1-2 4 9", 5))
+        self.assertEqual([], cli._pick("", 3))
+        self.assertEqual([], cli._pick("maybe", 3))
+
+
+class FlowState(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in (("STATE_DIR", self.tmp.name),
+                            ("FLOW_PATH", os.path.join(self.tmp.name, "flow.json")),
+                            ("PROJECTS", self.tmp.name)):
+            patch = mock.patch.object(herdr_close, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        herdr_close._paths.clear()
+
+    def session(self, sid, *turns):
+        os.makedirs(os.path.join(self.tmp.name, "proj"), exist_ok=True)
+        transcript(os.path.join(self.tmp.name, "proj", f"{sid}.jsonl"), *turns)
+
+    def pane(self, sid, status="idle"):
+        return {"pane_id": f"p-{sid}", "agent": "claude", "agent_status": status,
+                "agent_session": {"value": sid}, "terminal_title_stripped": f"tab {sid}"}
+
+    def test_say_types_the_text_and_marks_the_session(self):
+        calls = []
+        herdr_close.say(lambda m, p: calls.append((m, p)), "p1", "s1", "yes")
+        self.assertEqual([("agent.prompt", {"target": "p1", "text": "yes"})], calls)
+        self.assertEqual("yes", herdr_close.load_flow()["s1"]["said"])
+
+    def test_gather_shows_replies_after_the_send_and_counts_the_working(self):
+        sent = ledger._ts("2026-10-08T10:01:00Z")
+        self.session("replied", ("assistant", OFFER, "2026-10-08T10:02:00Z"))
+        self.session("quiet", ("assistant", "old", "2026-10-08T09:00:00Z"))
+        self.session("typed", ("assistant", OFFER, "2026-10-08T09:00:00Z"))
+        self.session("plain", ("assistant", "All set.", "2026-10-08T09:00:00Z"))
+        for sid in ("replied", "quiet", "busy"):
+            herdr_close.mark(sid, herdr_close.CLOSE_PROMPT, now=sent)
+        panes = [self.pane("replied"), self.pane("quiet"), self.pane("busy", "working"),
+                 self.pane("typed"), self.pane("plain")]
+        items, checking = herdr_close.gather(panes, herdr_close.load_flow(), now=sent + 30)
+        self.assertEqual(["replied", "typed"], sorted(i["sid"] for i in items))
+        self.assertEqual(["busy"], [c["sid"] for c in checking])
+
+    def test_a_send_that_never_started_shows_as_stalled(self):
+        sent = ledger._ts("2026-10-08T10:01:00Z")
+        self.session("quiet", ("assistant", "old", "2026-10-08T09:00:00Z"))
+        herdr_close.mark("quiet", herdr_close.CLOSE_PROMPT, now=sent)
+        items, _ = herdr_close.gather([self.pane("quiet")], herdr_close.load_flow(),
+                                      now=sent + 120)
+        self.assertTrue(items[0]["stalled"])
+
+    def test_leave_hides_until_the_next_reply(self):
+        self.session("s", ("assistant", OFFER, "2026-10-08T10:02:00Z"))
+        herdr_close.leave("s", ledger._ts("2026-10-08T10:02:00Z"))
+        self.assertEqual([], herdr_close.gather([self.pane("s")], herdr_close.load_flow())[0])
+        # A real transcript only grows; same-size rewrites can share an mtime tick.
+        self.session("s", ("assistant", OFFER + " Still ready.", "2026-10-08T10:09:00Z"))
+        self.assertEqual(1, len(herdr_close.gather([self.pane("s")],
+                                                   herdr_close.load_flow())[0]))
+
+    def test_prune_drops_sessions_whose_tab_is_gone(self):
+        herdr_close.mark("gone", "yes")
+        herdr_close.mark("here", "yes")
+        self.assertEqual(["here"], list(herdr_close.prune({"here"})))
 
 
 class CloseCandidates(unittest.TestCase):
@@ -632,19 +702,22 @@ class CloseCandidates(unittest.TestCase):
     def tab(self, pane, reply="All set.", recfields=None, **fields):
         path = os.path.join(self.tmp.name, f"{pane}.jsonl")
         transcript(path, ("assistant", reply, "2026-10-08T10:00:00Z"))
-        return row(pane, pane, rec=rec(pane, file=path, **(recfields or {})), **fields)
+        return row(pane, pane, rec=rec(pane, id=pane, file=path, **(recfields or {})),
+                   **fields)
 
-    def test_pending_report_vs_sendable_vs_skipped(self):
-        rows = [self.tab("pending", OFFER, verdict="GLANCE"),
+    def test_waiting_vs_sendable_vs_skipped(self):
+        rows = [self.tab("report", OFFER, verdict="GLANCE"),
+                self.tab("flowing", status="working"),
                 self.tab("send"),
                 self.tab("glance", verdict="GLANCE"),
                 self.tab("busy", status="working"),
                 self.tab("here", focused=True),
                 self.tab("codex", agent="codex"),
                 self.tab("trivial", recfields={"tool_calls": 0})]
-        pending, sendable = self.cli._close_candidates(rows)
-        self.assertEqual(["pending"], [i["pane_id"] for i in pending])
-        self.assertEqual("ready", pending[0]["state"])
+        with mock.patch.object(self.cli.herdr_close, "load_flow",
+                               return_value={"flowing": {"said": "yes"}}):
+            waiting, sendable = self.cli._close_candidates(rows)
+        self.assertEqual(["report", "flowing"], [r["pane_id"] for r in waiting])
         self.assertEqual(["send"], [r["pane_id"] for r in sendable])
 
 
@@ -662,95 +735,6 @@ class Space(unittest.TestCase):
         for name in ("misc", "nope"):
             with self.assertRaises(SystemExit):
                 self.cli._in_space(self.rows, name)
-
-
-class UsherPoll(unittest.TestCase):
-    def setUp(self):
-        self.cli = load_cli()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.path = os.path.join(self.tmp.name, "s.jsonl")
-        transcript(self.path, ("assistant", "old reply", "2026-10-08T10:00:00Z"))
-        self.item = self.cli._usher_item(row("p1", "k1", rec=rec("k1", file=self.path)))
-        self.item["sent_at"] = ledger._ts("2026-10-08T10:01:00Z")
-
-    def poll(self, panes, now="2026-10-08T10:01:10Z"):
-        snap = {"snapshot": {"panes": panes}}
-        with mock.patch.object(self.cli.ledger, "call", return_value=snap), \
-                mock.patch.object(self.cli.time, "time", return_value=ledger._ts(now)):
-            self.cli._usher_poll([self.item])
-
-    def test_a_gone_pane_closed_itself(self):
-        self.poll([])
-        self.assertEqual("closed", self.item["state"])
-
-    def test_ready_only_after_a_new_reply_and_two_idle_polls(self):
-        idle = [{"pane_id": "p1", "agent_status": "idle"}]
-        self.poll(idle)
-        self.assertEqual("waiting", self.item["state"])
-        transcript(self.path, ("assistant", OFFER, "2026-10-08T10:01:30Z"))
-        self.poll(idle)
-        self.assertEqual("waiting", self.item["state"])
-        self.poll(idle)
-        self.assertEqual(("ready", OFFER), (self.item["state"], self.item["reply"]))
-
-    def test_working_resets_the_idle_count(self):
-        transcript(self.path, ("assistant", "step one", "2026-10-08T10:01:30Z"))
-        self.poll([{"pane_id": "p1", "agent_status": "idle"}])
-        self.poll([{"pane_id": "p1", "agent_status": "working"}])
-        self.poll([{"pane_id": "p1", "agent_status": "idle"}])
-        self.assertEqual("waiting", self.item["state"])
-
-    def test_blocked_is_ready_at_once(self):
-        self.poll([{"pane_id": "p1", "agent_status": "blocked"}])
-        self.assertTrue(self.item["blocked"])
-        self.assertEqual("ready", self.item["state"])
-
-    def test_a_prompt_that_never_started_is_stalled(self):
-        self.poll([{"pane_id": "p1", "agent_status": "idle"}], now="2026-10-08T10:02:00Z")
-        self.assertTrue(self.item["stalled"])
-
-
-class UsherWalk(unittest.TestCase):
-    def setUp(self):
-        self.cli = load_cli()
-        self.said = []
-
-        def say(item, text, closing=False):
-            self.said.append((item["pane_id"], text))
-            item["state"] = "closed" if closing else "left"
-            return True
-
-        for name, fake in (("_usher_poll", lambda items: None), ("_say", say)):
-            patch = mock.patch.object(self.cli, name, side_effect=fake)
-            patch.start()
-            self.addCleanup(patch.stop)
-
-    def item(self, pane, reply):
-        return self.cli._usher_item(row(pane, pane, rec=rec(pane, file="/nope")), reply, NOW)
-
-    def test_yes_to_all_offers_in_one_answer(self):
-        items = [self.item("a", OFFER), self.item("b", OFFER)]
-        with mock.patch.object(self.cli, "_yes", return_value=True), \
-                mock.patch("builtins.print"):
-            self.cli._usher(items, popup=False)
-        self.assertEqual([("a", "yes"), ("b", "yes")], self.said)
-
-    def test_keep_y_asks_for_the_work_and_a_fresh_report(self):
-        items = [self.item("a", "**Verdict:** keep — 1 blocking\n\nShall I post it?")]
-        with mock.patch.object(self.cli, "_key", return_value="y"), \
-                mock.patch("builtins.print"):
-            self.cli._usher(items, popup=False)
-        self.assertEqual([("a", self.cli.SAY_DO_IT)], self.said)
-
-    def test_declined_batch_walks_each_and_k_leaves_it_unsaid(self):
-        items = [self.item("a", OFFER), self.item("b", OFFER)]
-        with mock.patch.object(self.cli, "_yes", return_value=False), \
-                mock.patch.object(self.cli, "_key", side_effect=["k", "y"]), \
-                mock.patch("builtins.print"):
-            self.cli._usher(items, popup=False)
-        self.assertEqual("left", items[0]["state"])
-        self.assertEqual([("b", "yes")], self.said)
 
 
 if __name__ == "__main__":

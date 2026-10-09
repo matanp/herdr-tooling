@@ -35,15 +35,8 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
     per tab or group with a Sonnet draft, checked open items and a single-key decision.
     `popup` opens it as a herdr popup.
   - Before the cards, `cull` offers to send `/close` to the closeable Claude tabs you pick
-    (CLOSE verdict, idle, not trivial). They audit themselves while you walk the cards; then
-    cull answers each report: one "yes" for every close offer, then a card per keep, bundled
-    question or plain reply, until the tab closes itself or you leave it. Tabs that already
-    end on an unanswered `/close` report join without being sent anything.
-  - `loops` finds closed sessions whose next step went nowhere, clears the ones a later
-    session resolved, and walks the rest. `review --since 7d` groups closes by disposition.
-  - Model runs go through `claude -p` (`HERDR_CULL_MODEL`), persisted under
-    `~/.local/state/herdr-sort/cull-runs` so `w` on a card can `claude --resume` them;
-    close notes are cached in `notes.json`, keyed by transcript size.
+    (CLOSE verdict, idle, not trivial), marked as a batch so the skill keeps its report short.
+    They are answered from herdr-dash's REPORTS section, so cull can be quit at any point.
 - **`herdr-compose`** — `prefix+i`: nvim split under the agent for the next prompt,
   `Ctrl-S` sends. `prefix+shift+k/j` scroll the agent.
 - **`herdr-keys`** — keybinding usage. `stats [--since 7d]`: per-binding counts, never-used
@@ -56,8 +49,13 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 
 ## Plugins (`plugins/`)
 
-- **`herdr-dash`** — `prefix+m`: agents, memory by pane, `MEMORY.md` health,
-  prefix cheat-sheet, notes. Set `HERDR_DASH_MEMORY_DIR` to your Claude Code memory directory.
+- **`herdr-dash`** — `prefix+m`: batch `/close` reports, ccusage spend, agents, memory by
+  pane, `MEMORY.md` health, prefix cheat-sheet, notes.
+  - REPORTS lists every session a batch `/close` is talking to, plus tabs ending on an
+    unanswered report. Enter opens a fixed-position card: what you type goes to that
+    session, bare Enter moves on, `/view` `/jump` `/leave` `/quit`. `Y` says yes to
+    every clean close offer. Flow state is `~/.local/state/herdr-sort/close-flow.json`,
+    shared with cull through `plugins/herdr-sort/herdr_close.py`. Set `HERDR_DASH_MEMORY_DIR` to your Claude Code memory directory.
 - **`herdr-sort`** — plugin wrapper, close ledger and cull core for `bin/herdr-sort`;
   the `cull` popup entrypoint and its action.
 - **`space-scope`** — `prefix+shift+s`: toggles the Agents panel between the current space and all spaces.
