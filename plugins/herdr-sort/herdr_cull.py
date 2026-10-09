@@ -22,6 +22,7 @@ CHECK_TYPES = ("repo_clean", "pr_merged", "file_exists", "paths_match", "ticket_
 FALLBACK_PROJECT = "Agent session log"
 ISSUE_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b")
 MAX_CANDIDATES = 12
+MAX_MARK_HOLDERS = 3
 RESOLVE_PREFIX = "resolved_later:"
 
 
@@ -202,7 +203,13 @@ def _card(kind, members, notes_by_key, probe, trivial=None):
 
 
 def _group(members, notes_by_key):
-    """Union members sharing a PR, a referenced issue, or a written file."""
+    """Union members sharing a PR, a referenced issue, or a written file.
+
+    Union is transitive, so one mark held by many tabs (an umbrella ticket, a file in
+    the shared checkout) chains unrelated work into a single card. A mark held by more
+    than MAX_MARK_HOLDERS tabs names a theme, not a shared piece of work, and links
+    nothing.
+    """
     parent = list(range(len(members)))
 
     def find(i):
@@ -211,14 +218,23 @@ def _group(members, notes_by_key):
             i = parent[i]
         return i
 
-    owner = {}
-    for i, member in enumerate(members):
+    marks_of = []
+    for member in members:
         rec = member["rec"] or {}
         note = notes_by_key.get(member["key"], (None, None))[0] or {}
-        marks = ([("pr", str(p)) for p in (rec.get("prs") or []) + (note.get("prs") or [])]
-                 + [("issue", i_) for i_ in note.get("issues") or []]
-                 + [("file", f) for f in _written(rec)])
+        marks_of.append(set(
+            [("pr", str(p)) for p in (rec.get("prs") or []) + (note.get("prs") or [])]
+            + [("issue", i_) for i_ in note.get("issues") or []]
+            + [("file", f) for f in _written(rec)]))
+    holders = {}
+    for marks in marks_of:
         for mark in marks:
+            holders[mark] = holders.get(mark, 0) + 1
+    owner = {}
+    for i, marks in enumerate(marks_of):
+        for mark in marks:
+            if holders[mark] > MAX_MARK_HOLDERS:
+                continue
             if mark in owner:
                 parent[find(i)] = find(owner[mark])
             else:
@@ -389,11 +405,17 @@ def assess(rows, index, closes, llm, now, notes=None, probe=None, progress=None,
     return cards + loops
 
 
-def draft(card, disposition):
+def _with_remark(body, remark):
+    if not remark or remark in body:
+        return body
+    return f"## Note\n{remark}\n\n{body}"
+
+
+def draft(card, disposition, remark=None):
     """Title and body that `record` files when the decision carries none."""
     note = card.get("note") or {}
     title = note.get("draft_title") or card["title"]
-    lines = []
+    lines = [f"## Note\n{remark}", ""] if remark else []
     if note.get("draft_body"):
         lines += [note["draft_body"].strip(), ""]
     if note.get("outcome"):
@@ -436,7 +458,8 @@ def record(card, decision, linear, now):
     if "kept" == disposition:
         return []
     note = card.get("note") or {}
-    text = (decision.get("note") or "").strip() or None
+    remark = (decision.get("remark") or "").strip() or None
+    text = (decision.get("note") or "").strip() or remark
     ref = ref_url = None
     if "dropped" == disposition and not text:
         raise ValueError("dropped needs a reason")
@@ -449,8 +472,8 @@ def record(card, decision, linear, now):
                                          else next(iter(known), None))
         if "merged" == disposition and not target:
             raise ValueError("merged needs --ref: the surviving tab's ticket")
-        made = draft(card, disposition)
-        body = decision.get("body") or made["body"]
+        made = draft(card, disposition, remark)
+        body = _with_remark(decision.get("body") or made["body"], remark)
         if target:
             comment = linear.comment(target, body)
             ref, ref_url = f"{target}#{comment['id']}", comment.get("url")

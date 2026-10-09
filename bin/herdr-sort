@@ -46,7 +46,8 @@ options:
 
 cull / loops keys:
   d done (only when every check passes)  f file  m merge  x drop  t trivial  k keep
-  s skip (loops)  j jump to tab  e edit draft in nvim  p project  w why  q quit
+  s skip (loops)  n note (saved per session, filed with the card)  j jump to tab
+  e edit draft in nvim  p project  w why  q quit
 """
 
 import fcntl
@@ -902,9 +903,12 @@ def cmd_ledger(args, rest):
 CLOSE_AS = ("done", "filed", "merged", "dropped", "trivial")
 NOTES_PATH = os.path.join(ledger.STATE_DIR, "notes.json")
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+(?:#\S+)?$")
+REMARKS_PATH = os.path.join(ledger.STATE_DIR, "remarks.json")
+CARD_ITEMS = 6
 CULL_KEYS = {"d": "done", "f": "file", "m": "merge", "x": "drop", "t": "trivial",
-             "k": "keep", "j": "jump", "e": "edit", "p": "project", "w": "why", "q": "quit"}
-LOOP_KEYS = {"f": "file", "x": "drop", "t": "trivial", "s": "skip", "e": "edit",
+             "k": "keep", "n": "note", "j": "jump", "e": "edit", "p": "project", "w": "why",
+             "q": "quit"}
+LOOP_KEYS = {"f": "file", "x": "drop", "t": "trivial", "s": "skip", "n": "note", "e": "edit",
              "p": "project", "w": "why", "q": "quit"}
 
 
@@ -932,6 +936,33 @@ def _save_notes(notes):
     os.replace(tmp, NOTES_PATH)
 
 
+def _load_remarks():
+    try:
+        with open(REMARKS_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _card_remark(card, remarks):
+    return next((remarks[m["key"]] for m in card["members"] if m.get("key") in remarks), None)
+
+
+def _save_remark(card, remarks, text):
+    for member in card["members"]:
+        if not member.get("key"):
+            continue
+        if text:
+            remarks[member["key"]] = text
+        else:
+            remarks.pop(member["key"], None)
+    os.makedirs(ledger.STATE_DIR, exist_ok=True)
+    tmp = REMARKS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(remarks, handle)
+    os.replace(tmp, REMARKS_PATH)
+
+
 def _assess(rows, index, closes):
     cull, llm = _cull()
     linear, model = llm.ClaudeLinear(), llm.ClaudeLLM()
@@ -954,7 +985,7 @@ def _assess(rows, index, closes):
 def _decision(disposition, draft=None, note=None, ref=None):
     draft = draft or {}
     edited = draft.get("edited")
-    return {"disposition": disposition, "note": note, "ref": ref,
+    return {"disposition": disposition, "note": note, "ref": ref, "remark": draft.get("remark"),
             "project": draft.get("project"), "title": draft.get("title") if edited else None,
             "body": draft.get("body") if edited else None}
 
@@ -1077,6 +1108,43 @@ def _wrap(label, text, indent=11):
                          subsequent_indent=" " * indent)
 
 
+def _shown_items(card):
+    """Failing first, then manual; passed checks need no decision and are left out."""
+    seen, out = set(), []
+    for item in card.get("open_items") or []:
+        key = " ".join((item.get("text") or "").lower().split())
+        if "pass" == item.get("result") or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return sorted(out, key=lambda i: 0 if "fail" == i.get("result") else 1)
+
+
+def _counted(label, states):
+    if not states:
+        return None
+    tally = {}
+    for state in states:
+        tally[state] = tally.get(state, 0) + 1
+    return f"{label}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
+
+
+def _landed(arts):
+    prs = [f"PR {p['pr']} {p.get('state') or '?'}" for p in arts.get("prs") or []]
+    docs = [f"{d['path']} {'present' if d.get('exists') else 'MISSING'}"
+            for d in arts.get("docs") or []]
+    issues = [f"{i['id']} {i.get('state') or '?'}" for i in arts.get("issues") or []]
+    if len(prs) + len(docs) + len(issues) <= 6:
+        return " · ".join(prs + docs + issues)
+    parts = [
+        _counted("PRs", [p.get("state") or "?" for p in arts.get("prs") or []]),
+        _counted("docs", ["present" if d.get("exists") else "MISSING"
+                          for d in arts.get("docs") or []]),
+        _counted("issues", [i.get("state") or "?" for i in arts.get("issues") or []]),
+    ]
+    return " · ".join(p for p in parts if p)
+
+
 def _print_card(card, n, total, draft):
     note = card.get("note") or {}
     print(f"\n[{n}/{total}] {card['title']}")
@@ -1090,6 +1158,8 @@ def _print_card(card, n, total, draft):
             row, rec = m.get("row") or {}, m.get("rec") or {}
             print(f"    tab  {shorten(row.get('title') or rec.get('title') or '?', 50):<50} "
                   f"{shorten(row.get('workspace') or '', 18)}")
+    if draft.get("remark"):
+        print(_wrap("you said", draft["remark"]))
     if card.get("trivial"):
         print(_wrap("trivial", card["trivial"]))
     if card.get("note_error"):
@@ -1098,17 +1168,16 @@ def _print_card(card, n, total, draft):
         print(_wrap("outcome", note["outcome"]))
     if _next_step(card):
         print(_wrap("next", _next_step(card)))
-    for item in card.get("open_items") or []:
+    items = _shown_items(card)
+    for item in items[:CARD_ITEMS]:
         result = {"fail": "FAIL"}.get(item.get("result"), item.get("result") or "?")
         detail = f" ({item['detail']})" if item.get("detail") else ""
         print(_wrap(f"  {result}", f"{item.get('kind')}: {item.get('text')}{detail}"))
-    arts = card.get("artifacts") or {}
-    bits = [f"PR {p['pr']} {p.get('state') or '?'}" for p in arts.get("prs") or []]
-    bits += [f"{d['path']} {'present' if d.get('exists') else 'MISSING'}"
-             for d in arts.get("docs") or []]
-    bits += [f"{i['id']} {i.get('state') or '?'}" for i in arts.get("issues") or []]
-    if bits:
-        print(_wrap("landed", " · ".join(bits)))
+    if len(items) > CARD_ITEMS:
+        print(f"           … {len(items) - CARD_ITEMS} more open items (e shows all)")
+    landed = _landed(card.get("artifacts") or {})
+    if landed:
+        print(_wrap("landed", landed))
     project = draft.get("project") or card.get("project") or _cull()[0].FALLBACK_PROJECT
     suggest = card.get("suggested") or "-"
     if card.get("done_ok"):
@@ -1177,7 +1246,7 @@ def _key(prompt, allowed):
 def _edit_draft(card, draft):
     if draft.get("title") is None:
         seed = "done" if "done" == card.get("suggested") else "filed"
-        draft.update(_cull()[0].draft(card, seed))
+        draft.update(_cull()[0].draft(card, seed, draft.get("remark")))
     fd, path = tempfile.mkstemp(prefix="herdr-cull-", suffix=".md")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1272,8 +1341,9 @@ def _why(card):
 
 def _walk(cards, closer, llm, keys, others=None, popup=False):
     """One card at a time; returns how many were left undecided."""
+    remarks = _load_remarks()
     for n, card in enumerate(cards, 1):
-        draft = {}
+        draft = {"remark": _card_remark(card, remarks)}
         _print_card(card, n, len(cards), draft)
         while True:
             offered = {k: v for k, v in keys.items() if "d" != k or card.get("done_ok")}
@@ -1299,6 +1369,14 @@ def _walk(cards, closer, llm, keys, others=None, popup=False):
             if "w" == key:
                 _why(card)
                 continue
+            if "n" == key:
+                text = _line("  note (kept across runs; goes into whatever is filed; "
+                             "enter keeps it, - clears): ")
+                if text:
+                    draft["remark"] = None if "-" == text else text
+                    _save_remark(card, remarks, draft["remark"])
+                    print(_wrap("you said", draft["remark"] or "(cleared)"))
+                continue
             if "d" == key:
                 disposition = "done"
             elif "f" == key:
@@ -1311,7 +1389,8 @@ def _walk(cards, closer, llm, keys, others=None, popup=False):
             elif "t" == key:
                 disposition = "trivial"
             elif "x" == key:
-                reason = _line("  why drop it? (enter cancels) ")
+                hint = "enter uses your note" if draft.get("remark") else "enter cancels"
+                reason = _line(f"  why drop it? ({hint}) ") or draft.get("remark")
                 if not reason:
                     continue
                 disposition, extra = "dropped", {"note": reason}
