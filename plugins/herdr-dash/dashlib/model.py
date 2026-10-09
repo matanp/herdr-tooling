@@ -15,6 +15,7 @@ from . import notes as notes_mod
 from . import procmem
 from . import worktrees as worktrees_mod
 from . import tabs as tabs_mod
+from . import usage as usage_mod
 
 
 def _safe(fn, *args):
@@ -52,8 +53,8 @@ def _herdr_side():
 
 
 def collect(sections=None):
-    wanted = set(sections or ("tabs", "memory", "worktrees", "index", "agents", "keys",
-                              "notes"))
+    wanted = set(sections or ("usage", "tabs", "memory", "worktrees", "index", "agents",
+                              "keys", "notes"))
     model = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         jobs = {}
@@ -65,6 +66,8 @@ def collect(sections=None):
             jobs["keys"] = pool.submit(_safe, keys_mod.sheet)
         if "worktrees" in wanted:
             jobs["worktrees"] = pool.submit(_safe, worktrees_mod.scan)
+        if "usage" in wanted:
+            jobs["usage"] = pool.submit(_safe, usage_mod.collect)
         if "tabs" in wanted:
             jobs["tabs"] = pool.submit(_safe, tabs_mod.view)
         # Agents needs the snapshot, and the memory section wants its workspace

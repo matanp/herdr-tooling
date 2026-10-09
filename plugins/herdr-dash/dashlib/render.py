@@ -8,15 +8,17 @@ three incompatible sources and an unlabelled number from the
 wrong one is the specific way this section lies.
 """
 
+import datetime
 import os
+import time
 
 from . import agents as agents_mod
 from . import keys as keys_mod
 from . import notes as notes_mod
 
 GIB = 1024 ** 3
-SECTIONS = ("tabs", "memory", "worktrees", "index", "agents", "keys", "notes")
-TITLES = {"tabs": "TABS", "memory": "MEMORY", "worktrees": "WORKTREES",
+SECTIONS = ("usage", "tabs", "memory", "worktrees", "index", "agents", "keys", "notes")
+TITLES = {"usage": "USAGE", "tabs": "TABS", "memory": "MEMORY", "worktrees": "WORKTREES",
           "index": "MEMORY.md INDEX", "agents": "AGENTS", "keys": "PREFIX",
           "notes": "NOTES"}
 
@@ -110,12 +112,18 @@ def memory(model, width, out):
         out.append(Line())
         out.append(Line(
             f"  orphaned  {len(orphans)} pane(s) hold processes herdr no longer "
-            f"has — {gib(total)}, safe to kill", "crit"))
+            f"has — {gib(total)}, safe to kill · x kills", "crit",
+            ("orphan", [pane_id for pane_id, _ in orphans])))
         for pane_id, bucket in orphans[:4]:
             top = bucket["procs"][0]["cmd"] if bucket["procs"] else ""
             out.append(Line(_clip(
                 f"    {gib(bucket['bytes']):>7}  {pane_id:<9} "
-                f"{len(bucket['procs']):>3}p  {top}", width), "warn"))
+                f"{len(bucket['procs']):>3}p  {top}", width), "warn",
+                ("orphan", [pane_id])))
+        if len(orphans) > 4:
+            out.append(Line(
+                f"    {len(orphans) - 4} more — x on the line above kills all",
+                "dim"))
 
     out.append(Line())
     out.append(Line("  by pane   PSS, own processes only", "sub"))
@@ -346,7 +354,54 @@ def tabs(model, width, out):
             out.append(Line(_clip(f"       {row['next']}", width), "dim"))
 
 
-RENDERERS = {"tabs": tabs, "memory": memory, "worktrees": worktrees, "index": index,
+def _tokens(value):
+    for unit, size in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if value >= size:
+            return f"{value / size:.1f}{unit}"
+    return str(value)
+
+
+def _ago(seconds):
+    return f"{int(seconds)}s" if seconds < 90 else f"{int(seconds // 60)}m"
+
+
+def usage(model, width, out):
+    data = model.get("usage")
+    if not data or data.get("pending"):
+        out.append(_header("usage", "ccusage", width, model.get("_number")))
+        out.append(Line("  " + (model.get("usage_error") or "collecting…"),
+                        "crit" if model.get("usage_error") else "dim"))
+        return
+    totals = data.get("totals")
+    age = time.time() - data.get("fetched_at", 0)
+    right = f"ccusage · all agents · {_ago(age)} ago"
+    out.append(_header("usage", right, width, model.get("_number")))
+    if data.get("error"):
+        out.append(Line(_clip(f"  refresh failed: {data['error']}", width),
+                        "warn" if totals else "crit"))
+    if not totals:
+        return
+    if data.get("warning"):
+        out.append(Line(_clip(f"  cost understated: {data['warning']}", width), "warn"))
+    if data.get("date") != datetime.date.today().isoformat():
+        out.append(Line(f"  figures are from {data.get('date')} — refreshing", "warn"))
+    labels = (("today", "today"), ("week", "this week"), ("month", "this month"))
+    if model.get("_brief"):
+        out.append(Line("  " + " · ".join(
+            f"{label} ${totals[key]['cost']:,.2f}" for key, label in labels),
+            "normal"))
+        return
+    for key, label in labels:
+        row = totals[key]
+        out.append(Line(
+            f"  {label:<11} {'$' + format(row['cost'], ',.2f'):>10}   {_tokens(row['tokens']):>7} tok   "
+            f"{row['days']}d", "normal"))
+    models = data.get("models_today") or []
+    if models:
+        out.append(Line(_clip("  today on   " + ", ".join(models), width), "dim"))
+
+
+RENDERERS = {"usage": usage, "tabs": tabs, "memory": memory, "worktrees": worktrees, "index": index,
              "agents": agents, "keys": keys, "notes": notes}
 
 

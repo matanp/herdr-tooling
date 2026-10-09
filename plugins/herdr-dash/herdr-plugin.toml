@@ -28,9 +28,9 @@ width = "86%"
 height = "80%"
 command = [
   "./run", "tui",
-  "--sections", "tabs,memory,worktrees,index,keys,notes",
+  "--sections", "usage,tabs,memory,worktrees,index,keys,notes",
   "--collapsed", "keys",
-  "--brief", "tabs,memory,index,worktrees",
+  "--brief", "usage,tabs,memory,index,worktrees",
 ]
 
 [[actions]]

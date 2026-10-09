@@ -9,7 +9,7 @@ usage: dash [command] [options]
   close-popup      dismiss it
 
 options:
-  --sections a,b   which sections, in order (default all six)
+  --sections a,b   which sections, in order (default all)
   --collapsed a,b  start these folded; z unfolds
   --brief a,b      render these as a summary line only
   --interval SECS  refresh floor (default 5)
@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dashlib import herdr as herdr_mod
 from dashlib import model as model_mod
 from dashlib import notes as notes_mod
+from dashlib import reap
 from dashlib import render
 
 PLUGIN_ID = "herdr-dash"
@@ -241,6 +242,8 @@ class Tui:
             hints = [f"1-{len(self.order)} section", "z fold", "j/k move"]
             if "agents" in self.order:
                 hints.append("enter focus pane")
+            if "memory" in self.order:
+                hints.append("x kill orphan")
             hints += ["n note", "e editor", "r refresh", "q quit"]
             text = (f" {time.strftime('%H:%M:%S', time.localtime(stamp))} "
                     f"({age}s ago)  │  " + " · ".join(hints))
@@ -384,7 +387,38 @@ class Tui:
                 self.say("d deletes a note; move the cursor to one")
         elif key == ord("e"):
             self.editor()
+        elif key == ord("x"):
+            self.kill_orphans()
         return True
+
+    def kill_orphans(self):
+        line = self.cursor_line()
+        if not line or "orphan" != line.target[0]:
+            self.say("x kills an orphaned pane; move the cursor to one")
+            return
+        pane_ids = line.target[1]
+        label = pane_ids[0] if 1 == len(pane_ids) else f"{len(pane_ids)} panes"
+        answer = self.prompt(f"kill every process of {label}? [y/N] ")
+        if (answer or "").strip().lower() not in ("y", "yes"):
+            self.say("kill cancelled")
+            return
+        self.say(f"killing {label}…", seconds=10)
+
+        def work():
+            try:
+                result = reap.kill(pane_ids)
+            except Exception as err:
+                self.say(f"kill refused: {err}")
+                return
+            message = f"{label}: SIGTERM {result['killed']}"
+            if result["forced"]:
+                message += f", SIGKILL {result['forced']}"
+            if result["skipped"]:
+                message += f" · back in herdr, spared: {', '.join(result['skipped'])}"
+            self.say(message, seconds=8)
+            self.refresher.refresh_now()
+
+        threading.Thread(target=work, daemon=True).start()
 
     def run(self):
         self.stdscr.timeout(250)
