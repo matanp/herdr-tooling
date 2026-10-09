@@ -118,3 +118,18 @@ a pane id in its place is refused as "the tab you're in", with nothing written. 
 `herdr-sort` to read it, which is why the command never runs in the same turn as the report.
 
 When `HERDR_PANE_ID` is unset, the session is not in herdr: deliver the report and stop.
+
+## Batch closes
+
+Arguments saying the `/close` was sent by `herdr-sort cull` mean the user is answering many tabs
+from one card each, not reading this session. The bar and the verdicts stay the same. These
+change:
+
+- Check read-only. Fix nothing in the audit turn; anything worth doing goes in a keep.
+- The card shows the verdict line, Outcome, Next step and the first six fail/manual items. Put
+  what the user must know there, and keep pass items to one line.
+- A keep proposes one set of actions the user can take with a single yes. Cull's `y` sends
+  "yes, do it", and the reply to that ends on the close report. A decision only the user can
+  make is a `filed` item, not a blocker.
+- Replies come from cull in the user's words: "yes", "yes, do it…", "close anyway, as filed",
+  "close it as dropped: <reason>". Treat them as typed.

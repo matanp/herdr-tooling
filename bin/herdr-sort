@@ -25,7 +25,8 @@ usage: herdr-sort <command> [options]
                        Optionally sends /close to chosen closeable Claude tabs first, then
                        answers their reports: yes to every close offer at once, then one
                        card per keep or question, until each tab closes itself or is left
-  popup                open `cull` as a herdr popup
+  cull --space NAME    the same, for one space only (exact name or a unique substring)
+  popup [--space NAME] open `cull` as a herdr popup
   loops                closed sessions whose next step went nowhere: clear the ones a
                        later session resolved, then file / drop / mark trivial the rest
   review [--since 7d]  closes in the window grouped by disposition, with Linear links
@@ -594,11 +595,11 @@ def main(argv):
     while i < len(argv):
         token = argv[i]
         if token in ("--settle", "--max-moves", "--rules", "-n", "--limit",
-                     "--as", "--ref", "--note", "--since"):
+                     "--as", "--ref", "--note", "--since", "--space"):
             if i + 1 >= len(argv):
                 raise SystemExit(f"herdr-sort: {token} needs a value")
             key = token.lstrip("-").replace("-", "_")
-            text_valued = ("--rules", "--as", "--ref", "--note", "--since")
+            text_valued = ("--rules", "--as", "--ref", "--note", "--since", "--space")
             args[key] = argv[i + 1] if token in text_valued else int(argv[i + 1])
             i += 2
             continue
@@ -937,9 +938,11 @@ def _load_notes():
 
 
 def _save_notes(notes):
+    # One tmp per writer: a batch of tabs closing themselves runs this concurrently, and a
+    # shared tmp name lets one process replace away the file another is still writing.
     os.makedirs(ledger.STATE_DIR, exist_ok=True)
-    tmp = NOTES_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
+    fd, tmp = tempfile.mkstemp(prefix="notes.", suffix=".tmp", dir=ledger.STATE_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(notes, handle)
     os.replace(tmp, NOTES_PATH)
 
@@ -1428,6 +1431,8 @@ SAY_YES = "yes"
 SAY_DO_IT = ("yes, do it. Then re-run the close checks and end on the close report and "
              "command; don't ask me to type /close again.")
 SAY_FILE = "close anyway, as filed"
+# The skill reads this argument as "answered in a batch"; a typed /close carries none.
+CLOSE_PROMPT = "/close sent by herdr-sort cull as part of a batch"
 USHER_KEYS = {
     "offer": {"y": "yes, close it", "r": "reply", "x": "drop", "c": "/close again",
               "v": "view", "j": "jump", "k": "leave open", "q": "quit"},
@@ -1544,7 +1549,7 @@ def _offer_close(rows):
         print("sent nothing; those tabs get cards instead")
         return pending
     rows = [sendable[n - 1] for n in chosen]
-    sent = [i for i in (_usher_item(row) for row in rows) if _say(i, "/close")]
+    sent = [i for i in (_usher_item(row) for row in rows) if _say(i, CLOSE_PROMPT)]
     print(f"sent /close to {len(sent)}; they work while you walk the cards\n")
     return pending + sent
 
@@ -1637,7 +1642,7 @@ def _print_usher(item, left):
     age = f" · replied {ledger.human(time.time() - item['replied_at'])} ago" \
         if item.get("replied_at") else ""
     print(f"  {item['workspace']} · {item['pane_id']}{age}")
-    if item["said"] and "/close" != item["said"]:
+    if item["said"] and CLOSE_PROMPT != item["said"]:
         print(_wrap("you said", item["said"]))
     if item["blocked"]:
         print(_wrap("blocked", "waiting on a permission prompt; j answers it in the tab"))
@@ -1726,7 +1731,7 @@ def _usher(items, popup):
             text = reason and f"close it as dropped: {reason}"
         else:
             text = {"y": SAY_DO_IT if "keep" == kind else SAY_YES, "f": SAY_FILE,
-                    "c": "/close"}[key]
+                    "c": CLOSE_PROMPT}[key]
         if text:
             _say(item, text, closing="y" == key and "offer" == kind)
 
@@ -1755,11 +1760,27 @@ def _verdict_rank(card):
     return min(ranks) if ranks else len(VERDICT_ORDER)
 
 
+def _in_space(rows, name):
+    """Rows of the one space named exactly, or by a unique substring, ignoring case."""
+    name = name.strip().lower()
+    spaces = sorted({r["workspace"] for r in rows})
+    exact = [s for s in spaces if s.strip().lower() == name]
+    found = exact or [s for s in spaces if name in s.lower()]
+    if len(found) != 1:
+        raise SystemExit(f"herdr-sort: --space {name!r} matches "
+                         + (", ".join(map(repr, found)) if found else "no open space"))
+    return [r for r in rows if r["workspace"] == found[0]]
+
+
 def cmd_cull(args, rest):
     popup = bool(os.environ.get("HERDR_SORT_POPUP"))
+    space = args.get("space") or os.environ.get("HERDR_SORT_SPACE")
     try:
         rows, index = ledger.assess()
         rows = _numbered_stale(rows)
+        if space:
+            rows = _in_space(rows, space)
+            print(f"only {rows[0]['workspace']!r}: {len(rows)} tabs")
         if not rows:
             print("no open tabs")
             return 0
@@ -1881,7 +1902,8 @@ def cmd_popup(args, rest):
         "width": "90%",
         "height": "90%",
         "focus": True,
-        "env": {"HERDR_SORT_POPUP": "1"},
+        "env": dict({"HERDR_SORT_POPUP": "1"},
+                    **({"HERDR_SORT_SPACE": args["space"]} if args.get("space") else {})),
     })
     return 0
 

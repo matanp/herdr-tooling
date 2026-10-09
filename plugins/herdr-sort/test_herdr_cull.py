@@ -648,6 +648,22 @@ class CloseCandidates(unittest.TestCase):
         self.assertEqual(["send"], [r["pane_id"] for r in sendable])
 
 
+class Space(unittest.TestCase):
+    def setUp(self):
+        self.cli = load_cli()
+        self.rows = [row("a", "a", workspace="Misc / AI Usage"),
+                     row("b", "b", workspace="Mentions"), row("c", "c", workspace="Misc / Dump")]
+
+    def test_exact_or_unique_substring(self):
+        self.assertEqual(["a"], [r["pane_id"] for r in self.cli._in_space(self.rows, "ai usage")])
+        self.assertEqual(["b"], [r["pane_id"] for r in self.cli._in_space(self.rows, "MENTIONS")])
+
+    def test_ambiguous_or_missing_space_refuses(self):
+        for name in ("misc", "nope"):
+            with self.assertRaises(SystemExit):
+                self.cli._in_space(self.rows, name)
+
+
 class UsherPoll(unittest.TestCase):
     def setUp(self):
         self.cli = load_cli()
