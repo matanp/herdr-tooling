@@ -27,6 +27,10 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   KEEP / GLANCE / CLOSE ratings, close with a reopenable ledger.
 - **`herdr-compose`** — `prefix+i`: nvim split under the agent for the next prompt,
   `Ctrl-S` sends. `prefix+shift+k/j` scroll the agent.
+- **`herdr-tabname`** — mirrors each pane's live session title into its tab label every 3s,
+  shortened to 20 characters or fewer by Haiku (one call per distinct title, cached). Only touches
+  bare-number labels or ones it wrote; type a name to keep it, a number to hand it back.
+  `plan`, `once`, `status`, `stop`; `ensure` starts the daemon if none is running.
 - **`ccnav-herdr`** — turn navigation, `prefix+u/d/f/a` (prev / next / newest / bottom),
   routed via `herdr-compose nav`.
 
@@ -50,6 +54,9 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 `herdr-project-brief.py` — on `SessionStart`, resolves the pane's herdr workspace and injects
 that workspace's `brief` from `sort-rules.toml` as context, so an unqualified prompt resolves
 to the right project. Silent on every failure path.
+
+`herdr-tabname ensure >/dev/null 2>&1 || true`, as a second `SessionStart` command, keeps the
+tab-label daemon running across reboots and herdr restarts, and hands it `ANTHROPIC_BASE_URL`.
 
 ## Keys
 
