@@ -55,6 +55,10 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   - Custom bindings are exact: each `[[keys.command]]` runs `herdr-keys run KEY -- CMD`.
   - Built-ins are inferred from the event stream by the `herdr-keys` plugin's startup
     watcher, so mouse and API calls count too. Log in `~/.local/state/herdr-keys/keys.jsonl`.
+- **`herdr-tabname`** — mirrors each pane's live session title into its tab label every 3s,
+  shortened to 20 characters or fewer by Haiku (one call per distinct title, cached). Only touches
+  bare-number labels or ones it wrote; type a name to keep it, a number to hand it back.
+  `plan`, `once`, `status`, `stop`; `ensure` starts the daemon if none is running.
 - **`ccnav-herdr`** — turn navigation (prev / next / newest / bottom) via
   `herdr-compose nav`. Not bound in `config/config.toml`.
 
@@ -85,6 +89,9 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 `herdr-project-brief.py` — on `SessionStart`, resolves the pane's herdr workspace and injects
 that workspace's `brief` from `sort-rules.toml` as context, so an unqualified prompt resolves
 to the right project. Silent on every failure path.
+
+`herdr-tabname ensure >/dev/null 2>&1 || true`, as a second `SessionStart` command, keeps the
+tab-label daemon running across reboots and herdr restarts, and hands it `ANTHROPIC_BASE_URL`.
 
 ## Claude Code skill
 
