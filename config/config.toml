@@ -3,6 +3,10 @@ onboarding = false
 agent_panel_sort = "spaces"
 
 show_agent_labels_on_pane_borders = true
+
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace", "agent"], ["tab"]]
+
 [keys]
 # Caps Lock is the real prefix: a Ghostty-scoped Karabiner chord emits ctrl+b, so
 # this must stay pinned even though it matches the default.
@@ -10,30 +14,6 @@ prefix = "ctrl+b"
 
 # Every [[keys.command]] runs through `herdr-keys run KEY --`, which logs the press
 # for `herdr-keys stats`. A binding added without the wrapper still works, uncounted.
-
-# ccnav-herdr — turn navigation. Failures toast; trail in
-# ~/.local/state/ccnav-herdr/nav.log.  Revert by deleting these blocks and
-# reloading (`herdr server reload-config`), not with `config reset-keys`.
-
-[[keys.command]]
-key = "prefix+u"           # previous turn
-type = "shell"
-command = "~/.local/bin/herdr-keys run prefix+u -- ~/.local/bin/herdr-compose nav prev"
-
-[[keys.command]]
-key = "prefix+d"           # next turn
-type = "shell"
-command = "~/.local/bin/herdr-keys run prefix+d -- ~/.local/bin/herdr-compose nav next"
-
-[[keys.command]]
-key = "prefix+f"           # newest turn
-type = "shell"
-command = "~/.local/bin/herdr-keys run prefix+f -- ~/.local/bin/herdr-compose nav newest"
-
-[[keys.command]]
-key = "prefix+a"           # back to the live tail
-type = "shell"
-command = "~/.local/bin/herdr-keys run prefix+a -- ~/.local/bin/herdr-compose nav bottom"
 
 [theme]
 name = "solarized"
@@ -60,6 +40,12 @@ key = "prefix+m"           # dashboard popup
 type = "shell"
 command = "~/.local/bin/herdr-keys run prefix+m -- ~/.local/share/herdr-plugins/herdr-dash/run popup"
 
+# A "dash" tab of three dash panes; focuses it if one exists in any space.
+[[keys.command]]
+key = "prefix+shift+m"     # dashboard split tab
+type = "shell"
+command = "~/.local/bin/herdr-keys run prefix+shift+m -- ~/.local/share/herdr-plugins/herdr-dash/run split"
+
 # viewer plugin — floating file picker with Markdown/code preview over the
 # focused pane's cwd. Revert by deleting this block and reloading
 # (`herdr server reload-config`), not with `config reset-keys`.
@@ -75,9 +61,7 @@ type = "shell"
 command = "~/.local/bin/herdr-keys run prefix+y -- ~/.local/share/herdr-plugins/viewer/view copy"
 
 # herdr-compose — nvim split under the agent for writing the next prompt;
-# <C-s> in nvim sends it. The ccnav bindings above go through `herdr-compose
-# nav` so they act on the agent while focus is in the compose pane. Revert by
-# deleting these blocks, restoring the ccnav commands, and reloading.
+# <C-s> in nvim sends it. Revert by deleting this block and reloading.
 
 [[keys.command]]
 key = "prefix+i"           # open/close compose split
@@ -93,3 +77,12 @@ command = "~/.local/bin/herdr-keys run prefix+shift+k -- ~/.local/bin/herdr-comp
 key = "prefix+shift+j"     # scroll agent down half a page
 type = "shell"
 command = "~/.local/bin/herdr-keys run prefix+shift+j -- ~/.local/bin/herdr-compose scroll down"
+
+# prsessions plugin — PRs the focused session touched and the other sessions behind
+# them; enter jumps to a live one or resumes it in a new tab. Revert by deleting
+# this block and reloading (`herdr server reload-config`), not with `config reset-keys`.
+
+[[keys.command]]
+key = "prefix+t"           # PR sessions popup
+type = "shell"
+command = "~/.local/bin/herdr-keys run prefix+t -- ~/.local/share/herdr-plugins/prsessions/prs popup"

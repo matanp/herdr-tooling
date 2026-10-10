@@ -55,8 +55,8 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   - Custom bindings are exact: each `[[keys.command]]` runs `herdr-keys run KEY -- CMD`.
   - Built-ins are inferred from the event stream by the `herdr-keys` plugin's startup
     watcher, so mouse and API calls count too. Log in `~/.local/state/herdr-keys/keys.jsonl`.
-- **`ccnav-herdr`** — turn navigation, `prefix+u/d/f/a` (prev / next / newest / bottom),
-  routed via `herdr-compose nav`.
+- **`ccnav-herdr`** — turn navigation (prev / next / newest / bottom) via
+  `herdr-compose nav`. Not bound in `config/config.toml`.
 
 ## Plugins (`plugins/`)
 
