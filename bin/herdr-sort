@@ -32,7 +32,11 @@ usage: herdr-sort <command> [options]
   log [words]          closed sessions, newest first: summary, time, next step, disposition
   log --all [words]    every session on the box, not only closed ones
   reopen <id|#n|words> reopen a closed session in its old space
-  ledger [--summarize] re-index transcripts; --summarize fills Haiku summaries
+  ledger               re-index transcripts
+  records              refresh the session records of open tabs now (the daemon does this
+                       as agents settle, cron every 15 minutes), then list them
+  records --force      refresh every open session that grew at all, settled or not
+  records --audit      also run the audit tier (close note) for every open session
 
 options:
   --settle SECS        title must hold still this long (default 30; 0 for once/plan)
@@ -41,7 +45,7 @@ options:
   --foreground         daemon: do not detach
   --verbose            log skip reasons too
   -n N                 log: rows to show (default 15)
-  --limit N            ledger --summarize: cap the Haiku calls
+  --quiet              records: one summary line, for cron
   --as D               close: disposition (done filed merged dropped trivial)
   --ref ID             close: Linear issue to comment on (merged: the surviving tab's ticket)
   --note TEXT          close: reason; required for dropped
@@ -509,9 +513,10 @@ def daemon(herdr, args):
     lock.write(str(os.getpid()))
     lock.flush()
 
-    wake = threading.Event()
+    wake, records_wake = threading.Event(), threading.Event()
     types = ["tab.created", "tab.renamed", "tab.closed", "pane.created", "pane.updated",
-             "pane.moved", "pane.closed", "workspace.created", "workspace.renamed"]
+             "pane.moved", "pane.closed", "workspace.created", "workspace.renamed",
+             "pane.agent_status_changed"]
 
     def reader():
         # The stream replays backlog on connect, so events are only a wake-up:
@@ -520,11 +525,13 @@ def daemon(herdr, args):
             try:
                 for _ in herdr.events(types):
                     wake.set()
+                    records_wake.set()
             except (OSError, SystemExit) as err:
                 log(f"event stream dropped ({err}); reconnecting in 5s")
             time.sleep(5)
 
     threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=records_loop, args=(records_wake,), daemon=True).start()
     log(f"daemon start pid={os.getpid()} settle={args['settle']}s socket={herdr.path}")
     state = load_state()
     titles_seen = {}
@@ -547,6 +554,34 @@ def daemon(herdr, args):
         except SystemExit as err:
             log(f"fatal: {err}")
             raise
+
+
+RECORDS_TICK_S = 20
+
+
+def records_loop(wake):
+    """Session records beside the sort loop. An agent that went idle is refreshed once its
+    transcript has been quiet for SETTLE_S, so this re-checks on a tick, not only on the
+    status event; records.refresh makes no model call while nothing has settled or grown."""
+    try:
+        recs, llm = _records()
+    except ImportError as err:
+        log(f"records off: {err}")
+        return
+    model = llm.ClaudeLLM()
+    while True:
+        wake.wait(timeout=RECORDS_TICK_S)
+        wake.clear()
+        now = time.time()
+        try:
+            _, _, store = recs.sweep(model, now)
+        except Exception as err:  # noqa: BLE001 -- the sort loop must outlive this thread
+            log(f"records error: {type(err).__name__}: {err}")
+        else:
+            built = [r.get("title") or k for k, r in store.items() if r.get("built_at") == now]
+            if built:
+                log(f"records refreshed {len(built)}: " + ", ".join(shorten(t, 30) for t in built))
+        time.sleep(5)
 
 
 DEFAULT_RULES = '''# herdr-sort rules -- first match wins.
@@ -589,7 +624,7 @@ def main(argv):
     i = 2
     while i < len(argv):
         token = argv[i]
-        if token in ("--settle", "--max-moves", "--rules", "-n", "--limit",
+        if token in ("--settle", "--max-moves", "--rules", "-n",
                      "--as", "--ref", "--note", "--since", "--space"):
             if i + 1 >= len(argv):
                 raise SystemExit(f"herdr-sort: {token} needs a value")
@@ -599,7 +634,7 @@ def main(argv):
             i += 2
             continue
         if token in ("--foreground", "--verbose", "--init", "--safe", "--yes", "--all",
-                     "--summarize", "--json", "--self"):
+                     "--summarize", "--json", "--self", "--force", "--audit", "--quiet"):
             args[token.lstrip("-")] = True
             i += 1
             continue
@@ -790,7 +825,7 @@ def cmd_close(args, rest):
     if not chosen:
         print("nothing to close")
         return 0
-    cards, linear, _ = _assess(chosen, index, [])
+    cards, linear, _ = _assess(chosen, index, [], all_rows=rows)
     cards = [c for c in cards if "open" == c["kind"]]
     plan, left = [], []
     for card in cards:
@@ -827,7 +862,8 @@ def cmd_close(args, rest):
 
 
 def cmd_log(args, rest):
-    index = ledger.load_index()
+    recs, _ = _records()
+    index, store = ledger.load_index(), recs.load()
     words = [w.lower() for w in rest]
 
     # Whole words, prefix-matched: "oa" must not hit "dashboard", but "expan" still
@@ -842,12 +878,13 @@ def cmd_log(args, rest):
         index, _ = ledger.sync(index)
         rows = sorted(index.values(), key=lambda r: -(r.get("last") or 0))
         rows = [(None, r) for r in rows if r.get("prompts") and hit(
-            r.get("title"), r.get("first_ask"), r.get("recap"), r.get("summary"))]
+            r.get("title"), r.get("first_ask"), r.get("recap"), r.get("summary"),
+            (store.get(r["key"]) or {}).get("recap"))]
     else:
         events = list(reversed(ledger.closes()))
         rows = [(n, e) for n, e in enumerate(events, 1)]
         rows = [(n, e) for n, e in rows if hit(
-            e.get("title"), e.get("workspace"),
+            e.get("title"), e.get("workspace"), (e.get("record") or {}).get("recap"),
             *[(index.get(e.get("key") or "") or {}).get(k) for k in ("recap", "summary", "first_ask")])]
     if not rows:
         print("no sessions match" if words else
@@ -863,11 +900,20 @@ def cmd_log(args, rest):
         if n is not None and item.get("disposition"):
             print(f"     {_disposition_line(item)}")
         if rec:
-            text, source = ledger.summary_of(rec)
+            if n is not None:
+                text, source = recs.closed_view(item, rec)
+                frozen = item.get("record") or {}
+            else:
+                live = recs.view(rec["key"], store)
+                text, source = ((live["text"], "record") if live
+                                else ledger.summary_of(rec))
+                frozen = store.get(rec["key"]) or {}
+            step = frozen.get("next_step") or rec.get("next_step")
             print(f"     {_stats(rec)}")
-            print(f"     {shorten(text, 150)}" + ("" if "recap" == source else f"  [{source}]"))
-            if rec.get("next_step") and rec["next_step"] not in text:
-                print(f"     {shorten(rec['next_step'], 150)}")
+            print(f"     {shorten(text, 150)}"
+                  + ("" if source in ("record", "recap") else f"  [{source}]"))
+            if step and step not in text:
+                print(f"     next: {shorten(step, 144)}")
             print(f"     {rec.get('resume')}")
         elif n is not None:
             print(f"     shell in {item.get('cwd')}; scrollback {item.get('scrollback') or 'empty'}")
@@ -884,22 +930,73 @@ def cmd_reopen(args, rest):
         print("several match; pick one by id:")
         for e in hits[:10]:
             print(f"  {(e.get('key') or ':').split(':', 1)[1][:8]}  {e.get('title')}")
+            text = _closed_recap(e)
+            if text:
+                print(f"            {shorten(text, 110)}")
         return 1
     pane, space = ledger.reopen(hits[0])
     print(f"reopened {hits[0].get('title')!r} in {space!r} ({pane})")
+    text = _closed_recap(hits[0])
+    if text:
+        print(_wrap("recap", text))
     return 0
+
+
+def _closed_recap(event):
+    rec = ledger.load_index().get(event.get("key") or "")
+    return _records()[0].closed_view(event, rec)[0]
 
 
 def cmd_ledger(args, rest):
     index, parsed = ledger.sync()
     print(f"indexed {len(index)} sessions ({parsed} re-parsed)")
     if args.get("summarize"):
-        pending = sum(ledger.needs_summary(r) for r in index.values())
-        cap = args.get("limit") or pending
-        print(f"summarizing {min(cap, pending)} of {pending} with {ledger.SUMMARY_MODEL}")
-        done, failed = ledger.summarize(index, limit=args.get("limit"), progress=print)
-        print(f"summarized {done}, failed {failed}")
+        print("--summarize is retired: open sessions keep a live record (`herdr-sort records`), "
+              "and a close freezes it into the ledger")
+        return 1
     return 0
+
+
+def cmd_records(args, rest):
+    recs, llm = _records()
+    now = time.time()
+    rows = ledger.live_panes()
+    audit = set()
+    if args.get("audit"):
+        audit = {r["key"] for r in rows if r.get("key") and r.get("agent") in recs.AGENTS}
+    _, index, store = recs.sweep(llm.ClaudeLLM(), now, audit=audit,
+                                 force=bool(args.get("force")), rows=rows)
+    open_keys = [r["key"] for r in rows if r.get("key") in store]
+    built = sum(store[k].get("built_at") == now for k in open_keys)
+    audited = sum(store[k].get("audit_at") == now for k in open_keys)
+    failed = sum(store[k].get("failed_at") == now for k in open_keys)
+    summary = (f"{len(open_keys)} open sessions: refreshed {built}, audited {audited}, "
+               f"failed {failed}")
+    if args.get("quiet"):
+        print(f"{datetime.datetime.now():%Y-%m-%d %H:%M} {summary}")
+        return 1 if failed else 0
+    if args.get("json"):
+        print(json.dumps({k: store[k] for k in open_keys}, indent=1))
+        return 0
+    print(summary)
+    by_key = {r["key"]: r for r in rows if r.get("key")}
+    for key in sorted(open_keys, key=lambda k: -(store[k].get("built_at") or 0)):
+        record, row = store[key], by_key[key]
+        age = (f"{ledger.human(now - record['built_at'])} ago" if record.get("built_at")
+               else "no record yet")
+        title = shorten(record.get("title") or row["title"] or "?", 50)
+        print(f"\n{shorten(row['workspace'], 19):<19} {title:<50} "
+              f"{row.get('status') or '?':<8} {age}")
+        view = recs.view(key, store, index.get(key))
+        if view:
+            print(_wrap("recap", view["text"]))
+        if view and view.get("needs"):
+            print(_wrap("needs", view["needs"]))
+        if view and view.get("next_step"):
+            print(_wrap("next", view["next_step"]))
+        if record.get("error"):
+            print(_wrap("error", record["error"]))
+    return 1 if failed else 0
 
 
 # --- dispositions: close --as, cull, loops, review ---------------------------
@@ -922,6 +1019,12 @@ def _cull():
     import herdr_cull
     import herdr_llm
     return herdr_cull, herdr_llm
+
+
+def _records():
+    import herdr_llm
+    import herdr_records
+    return herdr_records, herdr_llm
 
 
 def _load_notes():
@@ -969,8 +1072,12 @@ def _save_remark(card, remarks, text):
     os.replace(tmp, REMARKS_PATH)
 
 
-def _assess(rows, index, closes):
+def _assess(rows, index, closes, all_rows=None):
+    """Cards for rows and closes. An open tab's close note is its session record's audit,
+    reused while the transcript has not moved; notes.json still caches the loops' notes.
+    all_rows is every open pane, so a cull of one space does not freeze the others."""
     cull, llm = _cull()
+    recs, _ = _records()
     linear, model = llm.ClaudeLinear(), llm.ClaudeLLM()
     notes = _load_notes()
     started = time.time()
@@ -978,14 +1085,39 @@ def _assess(rows, index, closes):
     def progress(text):
         print(f"  {int(time.time() - started):>4}s  {text}", flush=True)
 
-    print("reading sessions; every draft is written before the first card", flush=True)
+    store = recs.load()
+    if rows:
+        audit = {r["key"] for r in rows if r.get("key") in index
+                 and not cull._trivial(r, index[r["key"]])}
+        fresh = sum((store.get(k) or {}).get("audit_for") == index[k].get("size") for k in audit)
+        print(f"auditing {len(audit) - fresh} sessions ({fresh} fresh audits reused)", flush=True)
+        store = recs.save(recs.refresh(all_rows or rows, index, store, model, started,
+                                       audit=audit, progress=progress), now=started)
+        for key in audit:
+            record = store.get(key) or {}
+            if record.get("audit") and record.get("audit_for") == index[key].get("size"):
+                notes[key] = {"size": index[key].get("size"), "note": record["audit"]}
     try:
         cards = cull.assess(rows, index, closes, model, started, notes=notes,
                             probe=cull.RealProbe(linear=linear), progress=progress)
     finally:
         _save_notes(notes)
+    for card in cards:
+        card["recap"] = _card_recap(card, store, index)
     print(f"{len(cards)} cards in {int(time.time() - started)}s\n", flush=True)
     return cards, linear, model
+
+
+def _card_recap(card, store, index):
+    """The newest member's record; a loop's is the one frozen into its close event."""
+    recs, _ = _records()
+    member = max(card["members"], key=lambda m: (m.get("rec") or {}).get("last") or 0)
+    if "loop" == card["kind"]:
+        text, source = recs.closed_view(member.get("event"), member.get("rec"))
+        frozen = (member.get("event") or {}).get("record") or {}
+        return {"text": text, "source": source, "at": frozen.get("built_at"),
+                "needs": None} if text else None
+    return recs.view(member.get("key"), store, index.get(member.get("key") or ""))
 
 
 def _decision(disposition, draft=None, note=None, ref=None):
@@ -1008,6 +1140,7 @@ class _Closer:
 
     def __init__(self, rows, index, linear):
         self.index, self.linear = index, linear
+        self.records = _records()[0]
         self.remaining = {r["workspace_id"]: r["workspace_panes"] for r in rows}
         self.closed, self.resolved, self.done_ids = 0, 0, set()
 
@@ -1055,7 +1188,10 @@ class _Closer:
         for row in rows:
             row["workspace_panes"] = self.remaining[row["workspace_id"]]
         extra = {f["pane_id"]: f for f in fields if f.get("pane_id")}
-        done = ledger.close(rows, self.index, extra=extra)
+        store = self.records.load()
+        frozen = {r["key"]: self.records.close_fields(r["key"], store)
+                  for r in rows if r.get("key")}
+        done = ledger.close(rows, self.index, extra=extra, records=frozen)
         for row in rows:
             if row.get("skipped"):
                 print(f"  kept {shorten(row['title'] or '(shell)', 46)}: {row['skipped']}")
@@ -1159,6 +1295,13 @@ def _print_card(card, n, total, draft):
         closed = [(m.get("event") or {}).get("closed_at") for m in card["members"]]
         where += f" · closed {_day(max(c for c in closed if c))}" if any(closed) else ""
     print(f"  {where}")
+    recap = card.get("recap")
+    if recap:
+        age = (f" ({ledger.human(time.time() - recap['at'])} ago)" if recap.get("at")
+               else "" if "record" == recap.get("source") else " (no record yet)")
+        print(_wrap("recap", recap["text"] + age))
+        if recap.get("needs"):
+            print(_wrap("needs", recap["needs"]))
     if len(card["members"]) > 1:
         for m in card["members"]:
             row, rec = m.get("row") or {}, m.get("rec") or {}
@@ -1519,7 +1662,7 @@ def cmd_cull(args, rest):
     space = args.get("space") or os.environ.get("HERDR_SORT_SPACE")
     try:
         rows, index = ledger.assess()
-        rows = _numbered_stale(rows)
+        rows = everyone = _numbered_stale(rows)
         if space:
             rows = _in_space(rows, space)
             print(f"only {rows[0]['workspace']!r}: {len(rows)} tabs")
@@ -1528,7 +1671,8 @@ def cmd_cull(args, rest):
             return 0
         log(f"cull start: {len(rows)} open tabs")
         skip = _offer_close(rows)
-        cards, linear, llm = _assess([r for r in rows if r["pane_id"] not in skip], index, [])
+        cards, linear, llm = _assess([r for r in rows if r["pane_id"] not in skip], index, [],
+                                     all_rows=everyone)
         everything = [c for c in cards if "open" == c["kind"]]
         held = [c for c in everything if all(_held(m.get("row") or {}) for m in c["members"])]
         cards = sorted((c for c in everything if c not in held), key=_verdict_rank)
@@ -1647,7 +1791,8 @@ def cmd_popup(args, rest):
 
 LEDGER_COMMANDS = {"stale": cmd_stale, "close": cmd_close, "log": cmd_log,
                    "reopen": cmd_reopen, "ledger": cmd_ledger, "cull": cmd_cull,
-                   "loops": cmd_loops, "review": cmd_review, "popup": cmd_popup}
+                   "loops": cmd_loops, "review": cmd_review, "popup": cmd_popup,
+                   "records": cmd_records}
 
 
 if __name__ == "__main__":

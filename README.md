@@ -34,6 +34,17 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   - `cull` walks open tabs: one confirmation for trivial and verified-done tabs, then one card
     per tab or group with a Sonnet draft, checked open items and a single-key decision.
     `popup` opens it as a herdr popup.
+  - Session records: one live record per open Claude or Codex session in
+    `~/.local/state/herdr-sort/records.json`, holding a recap (what the session is for, what
+    got done, where it stands), what it needs from you, and its next step. The daemon
+    refreshes a session once its agent is idle and its transcript has been quiet for a
+    minute, if it grew since the last recap; `herdr-sort records` runs the same sweep on
+    demand (`--force`, `--audit`). Recaps use `haiku` (`HERDR_RECAP_MODEL`); the audit tier
+    is cull's Sonnet close note, run when cull asks or after 6h idle, and reused while the
+    transcript is unchanged. Closing a tab freezes its record into the close event. The dash,
+    cull cards, `log`, `loops` and `reopen` read records and never call a model.
+  - Cron backstop for when the daemon is down or misses an event (cron's `PATH` must reach `claude`):
+    `*/15 * * * * PATH=$HOME/.local/bin:/usr/bin:/bin herdr-sort records --quiet >> ~/.local/state/herdr-sort/records.log 2>&1`
   - Before the cards, `cull` offers to send `/close` to the closeable Claude tabs you pick
     (CLOSE verdict, idle, not trivial), marked as a batch so the skill keeps its report short.
     They are answered from herdr-dash's REPORTS section, so cull can be quit at any point.
@@ -52,7 +63,8 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 - **`herdr-dash`** — `prefix+m`: batch `/close` reports, ccusage spend, agents, memory by
   pane, `MEMORY.md` health, prefix cheat-sheet, notes.
   - REPORTS lists every session a batch `/close` is talking to, plus tabs ending on an
-    unanswered report. Enter opens a fixed-position card: what you type goes to that
+    unanswered report. Enter opens a fixed-position card, topped by the session record's recap
+    and its age (first ask plus Claude Code's last recap before one is built): what you type goes to that
     session, bare Enter moves on, `/view` `/jump` `/leave` `/quit`. `Y` says yes to
     every clean close offer. Flow state is `~/.local/state/herdr-sort/close-flow.json`,
     shared with cull through `plugins/herdr-sort/herdr_close.py`. Set `HERDR_DASH_MEMORY_DIR` to your Claude Code memory directory.

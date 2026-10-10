@@ -526,7 +526,7 @@ class CloseSelf(unittest.TestCase):
         patches = [
             mock.patch.object(self.cli.ledger, "assess", return_value=(self.rows, {})),
             mock.patch.object(self.cli, "_assess",
-                              side_effect=lambda rows, *_: (self.assessed.extend(rows)
+                              side_effect=lambda rows, *_, **__: (self.assessed.extend(rows)
                                                             or ([], None, None))),
         ]
         for patch in patches:
@@ -640,6 +640,9 @@ class FlowState(unittest.TestCase):
             patch = mock.patch.object(herdr_close, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+        patch = mock.patch.object(herdr_close, "load_records", return_value={})
+        patch.start()
+        self.addCleanup(patch.stop)
         herdr_close._paths.clear()
 
     def session(self, sid, *turns):

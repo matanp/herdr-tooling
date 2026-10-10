@@ -27,6 +27,7 @@ CLOSE_PROMPT = "/close sent by herdr-sort cull as part of a batch"
 REPORT_VERDICT = re.compile(r"\*\*Verdict:?\*\*:?\s*((?:keep|close|don.t close)[^\n]*)", re.I)
 REPORT_COMMAND = re.compile(r"herdr-sort close\b[^\n`]*?--self\b[^\n`]*")
 REPORT_NEXT = re.compile(r"^\*\*Next step:\*\*\s*(.+)$", re.M)
+RECAP_TRAILER = re.compile(r"\s*\(disable recaps in /config\)\s*$")
 REPORT_ITEM = re.compile(r"^\s*-\s*\[(fail|manual|unverified)\]\s*(.+)$", re.M | re.I)
 
 _paths = {}
@@ -52,43 +53,120 @@ def _ts(text):
 
 
 _tails = {}
+_asks = {}
 
 
-def tail_reply(path):
-    """(text, timestamp) of the last assistant text in a Claude transcript, read from its
-    end and cached on (size, mtime), since the dash asks every few seconds."""
+def _tail(path):
+    """The end of a transcript, cached on (size, mtime) since the dash asks every few
+    seconds: the last assistant text and its time, when /close last arrived, and Claude
+    Code's own recaps (away_summary) with their times."""
     try:
         stat = os.stat(path)
     except (OSError, TypeError):
-        return None, None
+        return {"reply": None, "stamp": None, "close_at": None, "recaps": []}
     sig = (stat.st_size, stat.st_mtime_ns)
     if path in _tails and _tails[path][0] == sig:
         return _tails[path][1]
-    found = (None, None)
+    info = {"reply": None, "stamp": None, "close_at": None, "recaps": []}
     try:
         with open(path, "rb") as handle:
             handle.seek(max(0, stat.st_size - TAIL_BYTES))
             lines = handle.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        return found
-    for line in reversed(lines):
-        if '"assistant"' not in line:
+        return info
+    for line in lines:
+        if not any(m in line for m in ('"assistant"', '"away_summary"', "/close</command-name>")):
             continue
         try:
             row = json.loads(line)
         except ValueError:
             continue
-        if "assistant" != row.get("type") or row.get("isSidechain"):
-            continue
-        content = (row.get("message") or {}).get("content")
-        texts = [b["text"] for b in content if isinstance(b, dict)
-                 and "text" == b.get("type") and b.get("text", "").strip()] \
-            if isinstance(content, list) else []
-        if texts:
-            found = (texts[-1], _ts(row.get("timestamp")))
-            break
-    _tails[path] = (sig, found)
+        kind, stamp = row.get("type"), _ts(row.get("timestamp"))
+        if "system" == kind and "away_summary" == row.get("subtype"):
+            text = RECAP_TRAILER.sub("", row.get("content") or "").strip()
+            if text:
+                info["recaps"].append((stamp, text))
+        elif "user" == kind and "/close</command-name>" in line:
+            info["close_at"] = stamp
+        elif "assistant" == kind and not row.get("isSidechain"):
+            content = (row.get("message") or {}).get("content")
+            texts = [b["text"] for b in content if isinstance(b, dict)
+                     and "text" == b.get("type") and b.get("text", "").strip()] \
+                if isinstance(content, list) else []
+            if texts:
+                info["reply"], info["stamp"] = texts[-1], stamp
+    _tails[path] = (sig, info)
+    return info
+
+
+def tail_reply(path):
+    """(text, timestamp) of the last assistant text in a Claude transcript."""
+    info = _tail(path)
+    return info["reply"], info["stamp"]
+
+
+def first_ask(path):
+    """The session's first human prompt, read from the head once: it never changes."""
+    if path in _asks:
+        return _asks[path]
+    found = None
+    try:
+        with open(path, errors="replace") as handle:
+            for n, line in enumerate(handle):
+                if n > 2000:
+                    break
+                if '"user"' not in line or '"isMeta":true' in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                content = (row.get("message") or {}).get("content")
+                text = content if isinstance(content, str) else " ".join(
+                    b.get("text", "") for b in content or []
+                    if isinstance(b, dict) and "text" == b.get("type"))
+                text = text.strip()
+                if "user" == row.get("type") and text and not text.startswith("<"):
+                    found = " ".join(text.split())
+                    break
+    except OSError:
+        pass
+    _asks[path] = found
     return found
+
+
+_records = {"sig": None, "data": {}}
+
+
+def load_records():
+    """The session records store, re-read only when records.json changes. Any failure
+    reads as no records, so every session falls back and the dash keeps drawing."""
+    try:
+        import herdr_records
+        stat = os.stat(herdr_records.RECORDS_PATH)
+        sig = (stat.st_size, stat.st_mtime_ns)
+        if sig != _records["sig"]:
+            _records.update(sig=sig, data=herdr_records.load())
+        return _records["data"]
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def recap(sid, path, records):
+    """herdr_records.view for the session: its record's recap, else the first ask plus
+    Claude Code's newest recap from before /close arrived (later ones describe the close
+    itself). None when there is neither."""
+    info = _tail(path)
+    before = [t for stamp, t in info["recaps"]
+              if not info["close_at"] or (stamp or 0) < info["close_at"]]
+    fallback = {"first_ask": first_ask(path), "recap": before[-1] if before else None}
+    try:
+        import herdr_records
+        return herdr_records.view(f"claude:{sid}", records, fallback)
+    except Exception:  # noqa: BLE001
+        text = " · ".join(p for p in fallback.values() if p)
+        return {"text": text, "needs": None, "at": None, "source": "fallback"} if text \
+            else None
 
 
 def report(text):
@@ -177,6 +255,7 @@ def gather(panes, flow, now=None):
     session the batch is talking to. checking: in-flow sessions still working.
     """
     now = now or time.time()
+    records = load_records()
     items, checking = [], []
     for pane in panes:
         sid = (pane.get("agent_session") or {}).get("value")
@@ -202,6 +281,7 @@ def gather(panes, flow, now=None):
         if entry.get("left") and (stamp or 0) <= entry["left"]:
             continue
         items.append({"pane_id": pane["pane_id"], "sid": sid, "title": _title(pane),
+                      "recap": recap(sid, path, records) if path else None,
                       "status": status, "reply": text, "replied_at": stamp, "report": rep,
                       "said": entry.get("said"), "stalled": stalled, "blocked": blocked,
                       "told_yes": "yes" == (entry.get("said") or "").strip().lower()})

@@ -423,7 +423,11 @@ def _tokens(value):
 
 
 def _ago(seconds):
-    return f"{int(seconds)}s" if seconds < 90 else f"{int(seconds // 60)}m"
+    if seconds < 90:
+        return f"{int(max(0, seconds))}s"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m"
+    return f"{int(seconds // 3600)}h" if seconds < 172800 else f"{int(seconds // 86400)}d"
 
 
 def usage(model, width, out):

@@ -1,6 +1,6 @@
-"""Model and Linear adapters for herdr-sort cull, both over `claude -p`.
+"""Model and Linear adapters for herdr-sort cull and session records, all over `claude -p`.
 
-Every call is a persisted run started from ledger.MODEL_CWD, so a suggestion can be
+Every call but a recap is a persisted run started from ledger.MODEL_CWD, so a suggestion can be
 interrogated later with `claude --resume <model_session>`; the ledger skips that
 folder. Structured output comes back through --json-schema.
 """
@@ -40,24 +40,34 @@ def model():
     return os.environ.get("HERDR_CULL_MODEL", "claude-sonnet-5-5")
 
 
-def argv(schema, tools=()):
+def recap_model():
+    # The alias, not a dated id, so recaps follow the current Haiku.
+    return os.environ.get("HERDR_RECAP_MODEL", "haiku")
+
+
+def argv(schema, tools=(), model_name=None, persist=True):
     """--tools "" removes the built-ins; Linear tools exist only when named, and only
     those exact names are allowed, so anything else lands in permission_denials."""
-    args = ["claude", "-p", "--model", model(), "--output-format", "json",
+    args = ["claude", "-p", "--model", model_name or model(), "--output-format", "json",
             "--json-schema", json.dumps(schema), "--setting-sources", "",
             "--strict-mcp-config", "--tools", ""]
+    if not persist:
+        args.append("--no-session-persistence")
     if tools:
         args += ["--mcp-config", json.dumps(LINEAR_MCP), "--allowedTools", ",".join(tools)]
     return args
 
 
-def run(prompt, schema, tools=(), error=LLMError, timeout=300):
+def run(prompt, schema, tools=(), error=LLMError, timeout=300, model_name=None, persist=True,
+        meta=None):
     """One claude -p call -> (structured output, session id). Stderr alone is not a
-    failure: a connector warning is printed on every run."""
+    failure: a connector warning is printed on every run. meta, when given, receives the
+    model the alias resolved to."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
     os.makedirs(ledger.MODEL_CWD, exist_ok=True)
     try:
-        out = subprocess.run(argv(schema, tools), input=prompt, capture_output=True,
+        out = subprocess.run(argv(schema, tools, model_name, persist), input=prompt,
+                             capture_output=True,
                              text=True, timeout=timeout, cwd=ledger.MODEL_CWD, env=env)
     except (OSError, subprocess.TimeoutExpired) as err:
         raise error(f"claude -p: {err}") from err
@@ -68,6 +78,8 @@ def run(prompt, schema, tools=(), error=LLMError, timeout=300):
     except ValueError as err:
         raise error(f"unparseable claude -p output: {ledger._clip(out.stdout, 200)}") from err
     sid = result.get("session_id")
+    if meta is not None:
+        meta["model"] = next(iter(result.get("modelUsage") or {}), None)
     if result.get("is_error"):
         raise error(f"claude -p error ({sid}): {ledger._clip(str(result.get('result')), 300)}")
     if result.get("permission_denials"):
@@ -221,6 +233,12 @@ CLOSE_NOTE_SCHEMA = {
         "draft_title": {"type": "string"},
         "draft_body": {"type": "string"}}}
 
+RECAP_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["recap", "needs", "next_step"],
+    "properties": {"recap": {"type": "string"}, "needs": STR_OR_NULL,
+                   "next_step": STR_OR_NULL}}
+
 RESOLVED_SCHEMA = {
     "type": "object", "additionalProperties": False, "required": ["resolved_by", "why"],
     "properties": {"resolved_by": STR_OR_NULL, "why": {"type": "string"}}}
@@ -296,6 +314,38 @@ The final assistant message, in full:
 <final_reply>
 {final_reply}
 </final_reply>
+"""
+
+RECAP_PROMPT = """\
+You keep a live record of a coding-agent session that is still open in a terminal tab.
+The user runs dozens of these and comes back to each one cold. Read the session below and
+return its record.
+
+recap: two or three plain sentences, at most 70 words: what the session is for, what got
+done, and where it stands now. Name tickets, PRs and files only when they identify the
+work. No preamble, no markdown.
+needs: one line saying what the session is waiting on the user for right now -- an
+answer, an approval, a review, a decision -- or null when it needs nothing from them.
+next_step: the single next thing to do in this session, or null when it is finished.
+
+The previous record is context, not truth: rewrite whatever the newer turns changed.
+
+Session: {title}
+Agent: {agent}   cwd: {cwd}
+First request: {first_ask}
+Later requests:
+{asks}
+Previous record: {previous}
+
+Transcript tail (oldest first; tool calls and results clipped):
+<transcript>
+{tail}
+</transcript>
+
+The user's last prompt, in full:
+<last_prompt>
+{last_prompt}
+</last_prompt>
 """
 
 RESOLVED_PROMPT = """\
@@ -378,6 +428,26 @@ def _list(values, limit=20):
 # --- adapters ----------------------------------------------------------------
 
 class ClaudeLLM:
+    def recap(self, rec, previous=None):
+        """The recap tier: a current Haiku, unpersisted, since it runs on every settled turn."""
+        tail = transcript_tail(rec)
+        name = recap_model()
+        prompt = RECAP_PROMPT.format(
+            title=rec.get("title") or "(untitled)", agent=rec.get("agent"),
+            cwd=rec.get("cwd") or "?", first_ask=rec.get("first_ask") or "(none)",
+            asks="\n".join(f"- {a}" for a in rec.get("asks") or []) or "(none)",
+            previous=previous or "(none)", tail=tail["tail"] or "(empty)",
+            last_prompt=tail["last_prompt"] or "(none)")
+        meta = {}
+        data, _ = run(prompt, RECAP_SCHEMA, model_name=name, persist=False, timeout=180,
+                      meta=meta)
+        if not (data.get("recap") or "").strip():
+            raise LLMError("empty recap")
+        return {"recap": " ".join(data["recap"].split()),
+                "needs": (data.get("needs") or "").strip() or None,
+                "next_step": (data.get("next_step") or "").strip() or None,
+                "model": meta.get("model") or name}
+
     def close_note(self, rec):
         tail = transcript_tail(rec)
         try:

@@ -4,10 +4,10 @@ Closing a tab is only safe if the session can be found again, so every Claude an
 Codex session on the box gets one row: id, resume command, title, summary, span,
 engaged time, agent time, prompt count, files written, PRs named, and the recap's
 next step. Rows are rebuilt from the agents' own transcripts, so the ledger is a
-cache -- deleting sessions.json loses nothing but the Haiku summaries.
+cache -- deleting sessions.json loses nothing but the retired Haiku summaries, which
+remain the fallback for sessions closed before session records existed.
 """
 
-import concurrent.futures
 import datetime
 import fcntl
 import glob
@@ -29,9 +29,9 @@ CODEX_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
 CODEX_GLOBS = [os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"),
                os.path.expanduser("~/.codex/archived_sessions/rollout-*.jsonl")]
 
-SUMMARY_MODEL = "claude-haiku-4-5-20251001"
 # The tool's own claude -p runs start from these, so _sources() can recognise and
 # skip their project folders; the cull runs are persisted for `claude --resume`.
+# SUMMARY_CWD holds the retired Haiku summaries' runs.
 SUMMARY_CWD = os.path.join(STATE_DIR, "summarize")
 MODEL_CWD = os.path.join(STATE_DIR, "cull-runs")
 CLOSE_FIELDS = ("disposition", "note", "ref", "ref_url", "model_session")
@@ -249,8 +249,8 @@ SUMMARY_FIELDS = ("summary", "summary_source", "summary_for")
 
 
 def save_index(index):
-    """Merge under a lock: the dash, `stale`, and a long `--summarize` run all write
-    this file, and a plain overwrite from a stale copy would drop summaries."""
+    """Merge under a lock: the dash, `stale`, cull and the records sweep all write
+    this file, and a plain overwrite from a stale copy would drop old summaries."""
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(INDEX_PATH + ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -313,66 +313,6 @@ def sync(index=None, only=None, progress=None):
             progress(f"parsed {n}/{len(todo)}")
     save_index(index)
     return index, len(todo)
-
-
-def _summary_prompt(rec):
-    parts = [f"Session title: {rec.get('title') or '(none)'}",
-             f"First request: {rec.get('first_ask') or '(none)'}"]
-    if rec.get("asks"):
-        parts.append("Later requests:\n" + "\n".join(f"- {a}" for a in rec["asks"]))
-    parts.append(f"Final assistant reply: {rec.get('last_reply') or '(none)'}")
-    return ("Summarize this coding-agent session for a log the user skims to decide "
-            "whether to reopen it. One or two plain sentences, at most 45 words: what it "
-            "was about, then where it ended -- what got done and what was left open. "
-            "No preamble, no markdown.\n\n" + "\n\n".join(parts))
-
-
-def _haiku(prompt):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
-    os.makedirs(SUMMARY_CWD, exist_ok=True)
-    out = subprocess.run(
-        ["claude", "-p", "--model", SUMMARY_MODEL, "--no-session-persistence",
-         "--tools", "", "--strict-mcp-config", "--setting-sources", ""],
-        input=prompt, capture_output=True, text=True, timeout=120, cwd=SUMMARY_CWD, env=env)
-    text = out.stdout.strip()
-    if out.returncode or not text:
-        raise RuntimeError(_clip(out.stderr or f"exit {out.returncode}", 160))
-    return _clip(text, 400)
-
-
-def needs_summary(rec):
-    """Recaps are Claude Code's own summary; Haiku fills in only where none was written,
-    and re-runs when the session has grown since its summary."""
-    if rec.get("recap") or not (rec.get("first_ask") or rec.get("last_reply")):
-        return False
-    return rec.get("summary_for") != rec.get("size")
-
-
-def summarize(index, keys=None, workers=6, limit=None, progress=None):
-    todo = [r for r in index.values() if (keys is None or r["key"] in keys) and needs_summary(r)]
-    todo.sort(key=lambda r: -(r.get("last") or 0))
-    if limit:
-        todo = todo[:limit]
-    done = failed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = {pool.submit(_haiku, _summary_prompt(r)): r for r in todo}
-        for job in concurrent.futures.as_completed(jobs):
-            rec = jobs[job]
-            try:
-                rec["summary"] = job.result()
-                rec["summary_source"] = "haiku"
-                rec["summary_for"] = rec.get("size")
-                done += 1
-            except (RuntimeError, subprocess.TimeoutExpired) as err:
-                failed += 1
-                if progress:
-                    progress(f"summary failed for {rec['key']}: {err}")
-            if (done + failed) % 25 == 0:
-                save_index(index)
-                if progress:
-                    progress(f"summarized {done + failed}/{len(todo)}")
-    save_index(index)
-    return done, failed
 
 
 def summary_of(rec):
@@ -625,10 +565,11 @@ def _save_scrollback(row):
     return path
 
 
-def close(rows, index, extra=None):
+def close(rows, index, extra=None, records=None):
     """Record first, close second: a row that fails to record is never closed.
 
-    extra maps pane_id to disposition fields (CLOSE_FIELDS) for that row's event."""
+    extra maps pane_id to disposition fields (CLOSE_FIELDS) for that row's event;
+    records maps key to the session record fields frozen into it."""
     done = []
     os.makedirs(STATE_DIR, exist_ok=True)
     # Counted down per close, not read off the snapshot: a batch that sees one
@@ -653,6 +594,8 @@ def close(rows, index, extra=None):
                  "scrollback": _save_scrollback(row)}
         event.update({k: v for k, v in ((extra or {}).get(row["pane_id"]) or {}).items()
                       if k in CLOSE_FIELDS})
+        if (records or {}).get(row["key"]):
+            event["record"] = records[row["key"]]
         with open(CLOSES_PATH, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event) + "\n")
         try:
@@ -738,9 +681,11 @@ def dash_view(limit=8):
     recent = []
     for n, event in enumerate(reversed(events[-limit:]), 1):
         rec = index.get(event.get("key") or "", {})
-        text, _ = summary_of(rec) if rec else ("", "")
+        frozen = event.get("record") or {}
+        text = frozen.get("recap") or (summary_of(rec)[0] if rec else "")
         recent.append({"n": n, "when": event["closed_at"], "title": event.get("title") or "",
                        "workspace": event.get("workspace") or "",
-                       "next": rec.get("next_step") if rec else None, "summary": text})
+                       "next": frozen.get("next_step") or (rec.get("next_step") if rec else None),
+                       "summary": text})
     return {"recent": recent, "counts": _DASH["counts"], "counts_at": _DASH["at"],
             "error": _DASH.get("error"), "total_closed": len(events)}

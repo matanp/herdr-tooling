@@ -465,7 +465,18 @@ class Tui:
         height, width = self.stdscr.getmaxyx()
         wrap = max(30, width - 6)
         rep = item["report"]
-        lines = [(f"[{position or '?'} of {total}]  {item['title']}", "head")]
+        lines = []
+        recap = item.get("recap")
+        if recap:
+            age = f"{render._ago(time.time() - recap['at'])} ago" if recap.get("at") \
+                else "not built yet" if "fallback" == recap.get("source") else "age unknown"
+            lines.append((f"recap · {age}", "dim"))
+            lines += [(f"  {l}", "normal") for l in textwrap.wrap(recap["text"], wrap)[:4]]
+            if recap.get("needs"):
+                lines += [(f"  {l}", "warn")
+                          for l in textwrap.wrap(f"needs: {recap['needs']}", wrap)[:2]]
+            lines.append(("", "normal"))
+        lines.append((f"[{position or '?'} of {total}]  {item['title']}", "head"))
         if item["blocked"]:
             lines.append(("  waiting on a permission prompt: /jump answers it in the tab", "crit"))
         if item["stalled"]:
