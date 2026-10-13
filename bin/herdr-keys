@@ -280,13 +280,18 @@ def ago(ts):
     return "just now"
 
 
-def cull_report(since):
-    """Culling from herdr-sort's own records: its log and the close ledger are exact."""
-    sessions, outside, start = [], 0, None
+CULL_GAP_S = 20 * 60
+BURST_GAP_S = CULL_GAP_S
+
+
+def sort_log_markers(since):
+    """Cull starts and ends from sort.log. A cull that is quit early, or still running,
+    never writes its end line, so ends cannot be what defines a session."""
+    starts, ends = [], []
     try:
         lines = open(SORT_LOG, encoding="utf-8").read().splitlines()
     except OSError:
-        lines = []
+        return starts, ends
     for line in lines:
         try:
             ts = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
@@ -296,42 +301,93 @@ def cull_report(since):
             continue
         message = line[20:]
         if message.startswith("cull start"):
-            start = ts
-        elif (match := re.match(r"cull closed (\d+) tabs(?:; /close: (.*))?", message)):
+            starts.append(ts)
+        elif (match := re.match(r"cull closed \d+ tabs(?:; /close: (.*))?", message)):
             usher = {name: int(n) for n, name in
-                     re.findall(r"(\d+) ([a-z ]+?)(?=;|$)", match.group(2) or "")}
-            sessions.append({"end": ts, "start": start, "cards": int(match.group(1)),
-                             "self": usher.get("closed themselves", 0),
-                             "left": usher.get("left open", 0)})
-            start = None
-        elif (match := re.match(r"closed (\d+) tabs", message)):
-            outside += int(match.group(1))
-    dispositions = collections.Counter()
+                     re.findall(r"(\d+) ([a-z ]+?)(?=;|$)", match.group(1) or "")}
+            ends.append((ts, usher))
+    return starts, ends
+
+
+def cull_report(since):
+    """Culling counted from herdr-sort's close ledger, which every close path writes;
+    sort.log only marks where cull sessions start and end."""
+    closes = []
     try:
         with open(SORT_CLOSES, encoding="utf-8") as handle:
             for line in handle:
-                record = json.loads(line)
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
                 if record.get("closed_at", 0) >= since:
-                    dispositions[record.get("disposition") or "none"] += 1
-    except (OSError, ValueError):
+                    closes.append(record)
+    except OSError:
         pass
+    closes.sort(key=lambda r: r["closed_at"])
+    starts, ends = sort_log_markers(since)
 
-    print("\nCulling (herdr-sort; exact)")
+    sessions, taken, used = [], set(), []
+    for i, start in enumerate(starts):
+        limit = starts[i + 1] if i + 1 < len(starts) else float("inf")
+        end = next((e for e in ends if start <= e[0] < limit), None)
+        members, last = [], start
+        for j, record in enumerate(closes):
+            ts = record["closed_at"]
+            if j in taken or ts < start or ts >= limit:
+                continue
+            if end and ts > end[0] + 5:
+                break
+            # Without an end line, the session runs while closes keep coming.
+            if not end and ts - last > CULL_GAP_S:
+                break
+            members.append(j)
+            last = ts
+        taken.update(members)
+        used.append(end)
+        sessions.append({"start": start, "end": end[0] if end else last, "members": members,
+                         "usher": end[1] if end else {}, "ended": bool(end)})
+
+    # Closes made outside a marked cull (older culls, herdr-dash answers): a burst of
+    # three or more is reported as an unmarked session, the rest as one-off closes.
+    burst, outside = [], 0
+    for j, record in enumerate(closes + [None]):
+        if record is not None and j in taken:
+            continue
+        if record is not None and burst and \
+                record["closed_at"] - closes[burst[-1]]["closed_at"] <= BURST_GAP_S:
+            burst.append(j)
+            continue
+        if len(burst) >= 3:
+            lo, hi = closes[burst[0]]["closed_at"], closes[burst[-1]]["closed_at"]
+            end = next((e for e in ends if lo <= e[0] <= hi + 5 and e not in used), None)
+            used.append(end)
+            sessions.append({"start": None, "end": hi, "members": burst,
+                             "usher": end[1] if end else {}, "ended": None})
+        else:
+            outside += len(burst)
+        burst = [j] if record is not None else []
+
+    print("\nCulling (herdr-sort close ledger; exact)")
     if not sessions and not outside:
         print("  no culls or closes in this window")
         return
+    sessions.sort(key=lambda s: s["start"] or closes[s["members"][0]]["closed_at"]
+                  if s["members"] else s["start"])
     for s in sessions:
-        when = datetime.datetime.fromtimestamp(s["end"]).strftime("%m-%d %H:%M")
-        took = f"{int((s['end'] - s['start']) // 60)}m" if s["start"] else "?"
-        detail = f"{s['cards']} by card"
-        if s["self"] or s["left"]:
-            detail += f", {s['self']} closed themselves via /close, {s['left']} left open"
-        print(f"  {when}  {took:>4}  {s['cards'] + s['self']:>3} closed  ({detail})")
+        first = s["start"] or closes[s["members"][0]]["closed_at"]
+        when = datetime.datetime.fromtimestamp(first).strftime("%m-%d %H:%M")
+        took = f"{int((s['end'] - first) // 60)}m"
+        mix = collections.Counter(closes[j].get("disposition") or "none" for j in s["members"])
+        detail = ", ".join(f"{d} {n}" for d, n in mix.most_common())
+        if s["usher"].get("closed themselves"):
+            detail += f"; {s['usher']['closed themselves']} via /close"
+        flag = {True: "", False: "  (no end line: quit early or running)",
+                None: "  (no cull start: older cull or herdr-dash)"}[s["ended"]]
+        print(f"  {when}  {took:>4}  {len(s['members']):>3} closed  ({detail}){flag}")
+    in_sessions = sum(len(s["members"]) for s in sessions)
     print(f"  {len(sessions)} cull session{'s' if len(sessions) != 1 else ''}, "
-          f"{sum(s['cards'] + s['self'] for s in sessions)} tabs closed in them; "
-          f"{outside} closed outside a cull")
-    if dispositions:
-        print("  dispositions: " + " · ".join(f"{d} {n}" for d, n in dispositions.most_common()))
+          f"{in_sessions} tabs closed in them; {outside} closed outside a cull")
 
 
 def reset(_argv):

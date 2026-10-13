@@ -55,6 +55,8 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   - Custom bindings are exact: each `[[keys.command]]` runs `herdr-keys run KEY -- CMD`.
   - Built-ins are inferred from the event stream by the `herdr-keys` plugin's startup
     watcher, so mouse and API calls count too. Log in `~/.local/state/herdr-keys/keys.jsonl`.
+  - Culling is counted from herdr-sort's close ledger; `cull start` / `cull closed` lines in
+    `sort.log` only mark session bounds. `reset` clears the log and starts every section over.
 - **`herdr-tabname`** — mirrors each pane's live session title into its tab label every 3s,
   shortened to 20 characters or fewer by Haiku (one call per distinct title, cached). Only touches
   bare-number labels or ones it wrote; type a name to keep it, a number to hand it back.
