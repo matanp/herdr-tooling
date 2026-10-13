@@ -1,0 +1,9 @@
+# herdr-dash plugin — floating dashboard: memory by pane, worktrees, notes,
+# prefix cheat-sheet, MEMORY.md index health (plus tabs and agents where
+# herdr-sort and herdr-sessions are on). Popup is not reachable from the CLI,
+# so this shells out to a socket call.
+
+[[keys.command]]
+key = "prefix+m"           # dashboard popup
+type = "shell"
+command = "~/.local/share/herdr-plugins/herdr-dash/run popup"

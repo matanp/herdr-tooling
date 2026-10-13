@@ -3,7 +3,7 @@ name = "Space-scoped agent panel"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 description = "Filter the Agents panel to the space you are in"
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 [[startup]]
 command = ["./space-scope", "on"]

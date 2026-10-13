@@ -3,7 +3,7 @@ name = "Dashboard"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 description = "Tab verdicts, agents, memory by pane, notes, prefixes and MEMORY.md health in one view"
-platforms = ["linux"]
+platforms = ["linux", "macos"]
 
 # Two entrypoints, one renderer. The tab stays put and is scriptable; the popup
 # is opened from a key binding and is invisible to tooling -- it carries no pane

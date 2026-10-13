@@ -1,0 +1,12 @@
+# viewer plugin — floating file picker with Markdown/code preview over the
+# focused pane's cwd.
+
+[[keys.command]]
+key = "prefix+shift+v"     # file viewer popup
+type = "shell"
+command = "~/.local/share/herdr-plugins/viewer/view popup"
+
+[[keys.command]]
+key = "prefix+y"           # file viewer in copy mode: enter copies contents
+type = "shell"
+command = "~/.local/share/herdr-plugins/viewer/view copy"

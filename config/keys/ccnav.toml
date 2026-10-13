@@ -1,0 +1,35 @@
+# ccnav-herdr — turn navigation, routed through `herdr-compose nav` so it acts
+# on the agent while focus is in the compose pane. Failures toast; trail in
+# ~/.local/state/ccnav-herdr/nav.log.
+
+[[keys.command]]
+key = "prefix+u"           # previous turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav prev"
+
+[[keys.command]]
+key = "prefix+d"           # next turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav next"
+
+[[keys.command]]
+key = "prefix+f"           # newest turn
+type = "shell"
+command = "~/.local/bin/herdr-compose nav newest"
+
+[[keys.command]]
+key = "prefix+a"           # back to the live tail
+type = "shell"
+command = "~/.local/bin/herdr-compose nav bottom"
+
+# Half-page scroll of the agent from the compose pane; uses ccnav's geometry.
+
+[[keys.command]]
+key = "prefix+shift+k"     # scroll agent up half a page
+type = "shell"
+command = "~/.local/bin/herdr-compose scroll up"
+
+[[keys.command]]
+key = "prefix+shift+j"     # scroll agent down half a page
+type = "shell"
+command = "~/.local/bin/herdr-compose scroll down"

@@ -1,0 +1,7 @@
+# herdr-compose — nvim split under the agent for writing the next prompt;
+# <C-s> in nvim sends it.
+
+[[keys.command]]
+key = "prefix+i"           # open/close compose split
+type = "shell"
+command = "~/.local/bin/herdr-compose toggle"

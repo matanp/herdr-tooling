@@ -13,10 +13,20 @@ measurement:
 
 The pane join is the point: herdr puts HERDR_PANE_ID in every pane's
 environment, so /proc/<pid>/environ attributes a process to a pane.
+
+Without /proc (macOS) there is no PSS, no cgroup and no environ to read, so the
+sweep falls back to one `ps` call: RSS for every process, and the pane join by
+walking each pane's process tree down from the shell pid that
+pane.process_info reports. Processes that outlived their pane are not found
+that way, so the orphaned band stays empty there.
 """
 
 import os
+import re
+import subprocess
 import time
+
+from . import herdr as herdr_mod
 
 PROC = "/proc"
 CGROUP = "/sys/fs/cgroup"
@@ -24,6 +34,8 @@ KIB = 1024
 
 
 def meminfo():
+    if not os.path.isdir(PROC):
+        return _meminfo_darwin()
     out = {}
     try:
         with open(f"{PROC}/meminfo", encoding="utf-8") as handle:
@@ -34,6 +46,37 @@ def meminfo():
                     out[key] = int(fields[0]) * KIB
     except OSError:
         return {}
+    return out
+
+
+def _run(*argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=10).stdout
+
+
+_SWAP = re.compile(r"(total|free) = ([\d.]+)M")
+
+
+def _meminfo_darwin():
+    """The /proc/meminfo keys the renderer reads, from sysctl and vm_stat.
+
+    Available is free + inactive + speculative + purgeable pages, which is what
+    the kernel can hand out without paging -- close to Activity Monitor's figure.
+    """
+    out = {}
+    try:
+        out["MemTotal"] = int(_run("sysctl", "-n", "hw.memsize"))
+        stat = _run("vm_stat")
+        page = int(re.search(r"page size of (\d+)", stat).group(1))
+        pages = {key.strip(): int(value.strip(" .")) for key, value in
+                 (line.split(":", 1) for line in stat.splitlines()[1:] if ":" in line)
+                 if value.strip(" .").isdigit()}
+        out["MemAvailable"] = page * sum(pages.get(f"Pages {name}", 0) for name in
+                                         ("free", "inactive", "speculative", "purgeable"))
+        swap = dict(_SWAP.findall(_run("sysctl", "-n", "vm.swapusage")))
+        out["SwapTotal"] = int(float(swap.get("total", 0)) * KIB * KIB)
+        out["SwapFree"] = int(float(swap.get("free", 0)) * KIB * KIB)
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return out
     return out
 
 
@@ -151,8 +194,90 @@ def disks(paths=("/", "/tmp", os.path.expanduser("~"))):
     return out
 
 
+def _pane_shells():
+    """pane_id -> shell pid, for every live pane."""
+    client, out = herdr_mod.Herdr(), {}
+    for pane in herdr_mod.snapshot().get("panes", []):
+        try:
+            info = client.call("pane.process_info", {"pane_id": pane["pane_id"]})
+        except herdr_mod.HerdrError:
+            continue
+        shell = (info.get("process_info") or {}).get("shell_pid")
+        if shell:
+            out[shell] = pane["pane_id"]
+    return out
+
+
+def _clip(text, limit=60):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def sweep_ps(uid=None):
+    """The sweep's result shape from one `ps` call, for systems without /proc."""
+    started = time.monotonic()
+    uid = os.getuid() if uid is None else uid
+    procs, children = {}, {}
+    for line in _run("ps", "-A", "-o", "pid=,ppid=,uid=,rss=,command=").splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 5 or not fields[0].isdigit():
+            continue
+        pid, ppid, owner, rss = (int(field) for field in fields[:4])
+        procs[pid] = {"pid": pid, "uid": owner, "rss": rss * KIB, "cmd": fields[4]}
+        children.setdefault(ppid, []).append(pid)
+    try:
+        shells = _pane_shells()
+    except herdr_mod.HerdrError:
+        shells = {}
+    pane_of = {}
+    for shell, pane_id in shells.items():
+        stack = [shell]
+        while stack:
+            pid = stack.pop()
+            if pid in procs and pid not in pane_of:
+                pane_of[pid] = pane_id
+                stack.extend(children.get(pid, ()))
+    own, foreign, panes = [], [], {}
+    for pid, proc in procs.items():
+        if proc["uid"] != uid:
+            if proc["rss"]:
+                foreign.append({"pid": pid, "rss": proc["rss"], "uid": proc["uid"],
+                                "comm": os.path.basename(proc["cmd"].split(" -", 1)[0])})
+            continue
+        record = {"pid": pid, "bytes": proc["rss"], "source": "rss",
+                  "cmd": _clip(proc["cmd"]), "pane": pane_of.get(pid)}
+        own.append(record)
+        if record["pane"]:
+            bucket = panes.setdefault(record["pane"], {"bytes": 0, "procs": []})
+            bucket["bytes"] += record["bytes"]
+            bucket["procs"].append(record)
+    return _summary(own, foreign, panes, started, metric="RSS")
+
+
+def _summary(own, foreign, panes, started, metric="PSS"):
+    own.sort(key=lambda record: -record["bytes"])
+    foreign.sort(key=lambda record: -record["rss"])
+    for bucket in panes.values():
+        bucket["procs"].sort(key=lambda record: -record["bytes"])
+    return {
+        "own": own,
+        "foreign": foreign,
+        "panes": panes,
+        "own_total": sum(record["bytes"] for record in own),
+        "pane_total": sum(bucket["bytes"] for bucket in panes.values()),
+        "own_count": len(own),
+        "foreign_count": len(foreign),
+        # RSS is the only measure without /proc, so nothing fell back to it.
+        "degraded": 0 if "RSS" == metric else
+                    sum(1 for record in own if record["source"] == "rss"),
+        "metric": metric,
+        "elapsed_s": time.monotonic() - started,
+    }
+
+
 def sweep(uid=None):
     """One pass over /proc. Returns own-PSS totals, the pane join, and timing."""
+    if not os.path.isdir(PROC):
+        return sweep_ps(uid)
     started = time.monotonic()
     uid = os.getuid() if uid is None else uid
     own, foreign, panes = [], [], {}
@@ -182,21 +307,7 @@ def sweep(uid=None):
             bucket = panes.setdefault(record["pane"], {"bytes": 0, "procs": []})
             bucket["bytes"] += size
             bucket["procs"].append(record)
-    own.sort(key=lambda record: -record["bytes"])
-    foreign.sort(key=lambda record: -record["rss"])
-    for bucket in panes.values():
-        bucket["procs"].sort(key=lambda record: -record["bytes"])
-    return {
-        "own": own,
-        "foreign": foreign,
-        "panes": panes,
-        "own_total": sum(record["bytes"] for record in own),
-        "pane_total": sum(bucket["bytes"] for bucket in panes.values()),
-        "own_count": len(own),
-        "foreign_count": len(foreign),
-        "degraded": sum(1 for record in own if record["source"] == "rss"),
-        "elapsed_s": time.monotonic() - started,
-    }
+    return _summary(own, foreign, panes, started)
 
 
 def collect():

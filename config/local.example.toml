@@ -1,0 +1,23 @@
+# ~/.config/herdr/config.local.toml — this machine's own herdr settings.
+#
+# `install` writes ~/.config/herdr/config.toml as this file followed by the key
+# blocks of every component tooling.toml turns on. Edit this file, not
+# config.toml, then re-run install. Full reference: `herdr --default-config`.
+
+onboarding = false
+
+[keys]
+# Where Caps Lock sends ctrl+b through a Ghostty-scoped Karabiner chord, this
+# must stay pinned even though it matches the default.
+prefix = "ctrl+b"
+
+[ui]
+agent_panel_sort = "spaces"
+show_agent_labels_on_pane_borders = true
+
+[ui.toast]
+delivery = "off"
+
+[theme]
+name = "solarized"
+auto_switch = false

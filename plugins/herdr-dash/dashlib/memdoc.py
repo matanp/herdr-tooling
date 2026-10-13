@@ -15,9 +15,12 @@ otherwise indistinguishable from a wiki link and shows up as dangling.
 import os
 import re
 
+import tooling
+
 BUDGET = int(24.4 * 1024)
-DEFAULT_STORE = os.environ.get(
-    "HERDR_DASH_MEMORY_DIR", "~/.claude/projects/-home-me-code-myrepo/memory")
+DEFAULT_STORE = (os.environ.get("HERDR_DASH_MEMORY_DIR")
+                 or tooling.setting("dash", "memory-dir")
+                 or "~/.claude/projects/-home-me-code-myrepo/memory")
 
 _FENCE = re.compile(r"^\s*(```|~~~).*?^\s*\1", re.S | re.M)
 _SPAN = re.compile(r"`[^`\n]*`")

@@ -1,0 +1,6 @@
+# space-scope plugin — flip the Agents panel between this space and all spaces.
+
+[[keys.command]]
+key = "prefix+shift+s"
+type = "shell"
+command = "~/.local/bin/herdr-space-scope toggle"

@@ -2,8 +2,9 @@
 """SessionStart hook: tell a new Claude session which project its space owns.
 
 Resolves HERDR_WORKSPACE_ID to a workspace label over the herdr socket, looks
-that label up against the `brief` keys in sort-rules.toml, and returns the
-brief as additionalContext so an unqualified prompt ("status?") resolves.
+that label up against the [[brief]] tables in tooling.toml -- or, when it has
+none, the `brief` keys in sort-rules.toml -- and returns the brief as
+additionalContext so an unqualified prompt ("status?") resolves.
 
 Every failure path is silent and exit 0: a session start must never be blocked
 by this, and an unmatched or renamed workspace must inject nothing rather than
@@ -29,6 +30,13 @@ REPO_PATH = re.compile(r"(?:^|(?<=\s))(?:docs|app|lib|spec|config|db)/[A-Za-z0-9
 
 
 def briefs():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                    "..", "lib"))
+    import tooling
+    return tooling.briefs() or rule_briefs()
+
+
+def rule_briefs():
     with open(RULES, encoding="utf-8") as handle:
         chunks = RULE_SPLIT.split(handle.read())
     out = {}

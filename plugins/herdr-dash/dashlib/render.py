@@ -64,20 +64,23 @@ def memory(model, width, out):
         out.append(Line("  collecting…", "dim"))
         return
     info, cgroup, procs = data["meminfo"], data["cgroup"], data["procs"]
+    metric = procs.get("metric", "PSS")
     total = info.get("MemTotal", 0)
     available = info.get("MemAvailable", 0)
     swap_used = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
 
+    # Summed RSS counts a shared page once per sharer, so without PSS there is
+    # no honest machine-wide total of own processes; keep only the pane figure.
+    own = f"{gib(procs['own_total'])} own PSS · " if "PSS" == metric else ""
     out.append(_header(
         "memory",
-                       f"{gib(procs['own_total'])} own PSS · "
-                       f"{gib(procs['pane_total'])} in panes · "
+                       f"{own}{gib(procs['pane_total'])} in panes · "
                        f"{procs['elapsed_s']:.1f}s", width, model.get("_number")))
     tight = available < total * 0.12
     out.append(Line(
         f"  machine   {gib(total)} total · {gib(available)} available · "
         f"swap {gib(swap_used)}/{gib(info.get('SwapTotal', 0))} used"
-        f"{'' if not tight else '   LOW'}   [meminfo]",
+        f"{'' if not tight else '   LOW'}   [{'meminfo' if 'PSS' == metric else 'vm_stat'}]",
         "crit" if tight else "normal"))
     for disk in data.get("disks") or []:
         share = disk["used_fraction"]
@@ -88,7 +91,8 @@ def memory(model, width, out):
             "crit" if share > 0.9 else "warn" if share > 0.8 else "normal"))
     slice_bits = " · ".join(f"{name} {gib(value)}"
                                 for name, value in cgroup["slices"].items() if value)
-    out.append(Line(_clip(f"  cgroup    {slice_bits}   [cgroup]", width), "normal"))
+    if slice_bits:
+        out.append(Line(_clip(f"  cgroup    {slice_bits}   [cgroup]", width), "normal"))
     brief = bool(model.get("_brief"))
     services = " · ".join(
         f"{name.replace('.service', '').replace('.scope', '')[:22]} {gib(value)}"
@@ -118,7 +122,7 @@ def memory(model, width, out):
                 f"{len(bucket['procs']):>3}p  {top}", width), "warn"))
 
     out.append(Line())
-    out.append(Line("  by pane   PSS, own processes only", "sub"))
+    out.append(Line(f"  by pane   {metric}, own processes only", "sub"))
     ranked = [item for item in
               sorted(procs["panes"].items(), key=lambda item: -item[1]["bytes"])
               if item[0] in live or not model.get("panes_known")]
@@ -269,7 +273,8 @@ def keys(model, width, out):
     if not data:
         out.append(Line("  collecting…", "dim"))
         return
-    out.append(_header("keys", f"{data['prefix_label']} = {data['prefix']}",
+    out.append(_header("keys", data["prefix"] if data["prefix_label"] == data["prefix"]
+                       else f"{data['prefix_label']} = {data['prefix']}",
                        width, model.get("_number")))
     if data.get("error"):
         out.append(Line(f"  config unreadable: {data['error']}", "crit"))

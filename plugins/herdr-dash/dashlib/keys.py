@@ -12,10 +12,13 @@ import os
 import re
 import subprocess
 
-from . import toml_min
+import toml_min
+import tooling
 
 CONFIG = "~/.config/herdr/config.toml"
-PREFIX_LABEL = "Caps Lock"
+# What the prefix is called on this keyboard: "Caps Lock" behind the Karabiner
+# chord. [dash] prefix-label in tooling.toml; unset, the prefix names itself.
+PREFIX_LABEL = tooling.setting("dash", "prefix-label")
 
 _TRAILING = re.compile(r'^\s*key\s*=\s*"([^"]+)"\s*#\s*(.+?)\s*$')
 _DEFAULT = re.compile(r'^#\s*([a-z_]+)\s*=\s*"([^"]*)"(?:\s*#\s*(.*))?$')
@@ -95,12 +98,12 @@ def sheet(path=None):
         "path": path,
         "error": error,
         "prefix": keys.get("prefix") or "ctrl+b",
-        "prefix_label": PREFIX_LABEL,
+        "prefix_label": PREFIX_LABEL or keys.get("prefix") or "ctrl+b",
         "custom": custom,
         "overrides": sorted(overrides.items()),
         "defaults": defaults,
     }
 
 
-def pretty(binding, prefix_label=PREFIX_LABEL):
+def pretty(binding, prefix_label="prefix"):
     return binding.replace("prefix+", f"{prefix_label}+", 1)

@@ -1,0 +1,30 @@
+# ~/.config/herdr/tooling.toml — which herdr-tooling components this machine runs.
+#
+# Read by `install` (what to link, which keys to bind) and by the tools at
+# runtime. Re-run install after editing. A component left out is on.
+
+[components]
+compose     = true    # prefix+i  nvim prompt split
+viewer      = true    # prefix+shift+v / prefix+y  file viewer (needs python rich)
+dash        = true    # prefix+m  dashboard
+space-scope = true    # prefix+shift+s  Agents panel scope toggle
+brief-hook  = true    # Claude SessionStart hook injecting [[brief]] below
+sort        = false   # herdr-sort daemon + close ledger (sort-rules.toml)
+sessions    = false   # herdr-sessions table; Linux only (/proc)
+ccnav       = false   # turn navigation + compose scroll keys; Linux only (/proc)
+
+[dash]
+# Claude Code memory store whose MEMORY.md the index section checks.
+memory-dir = "~/.claude/projects/-home-me-code-myrepo/memory"
+# What the prefix is called on this keyboard, for the cheat-sheet.
+# prefix-label = "Caps Lock"
+
+[keys]
+# Rebind a component's default key, or "" to drop it:
+# "prefix+y" = "prefix+shift+y"
+
+# Injected into new Claude sessions whose herdr workspace has this label.
+# [[brief]]
+# workspace = "Public API"
+# lines = ["Treat this session as Public API work unless the prompt names a different subject.",
+#          "Scope and open questions: docs/api/GOALS.md -- read it first."]

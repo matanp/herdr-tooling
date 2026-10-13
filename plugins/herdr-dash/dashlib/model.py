@@ -7,6 +7,8 @@ its data or an error string, and the renderer prints whichever it finds.
 
 import concurrent.futures
 
+import tooling
+
 from . import agents as agents_mod
 from . import herdr as herdr_mod
 from . import keys as keys_mod
@@ -14,7 +16,20 @@ from . import memdoc
 from . import notes as notes_mod
 from . import procmem
 from . import worktrees as worktrees_mod
-from . import tabs as tabs_mod
+
+# Sections that read another component's code or output. With that component
+# off in tooling.toml the section is dropped, not rendered as an error.
+NEEDS = {"tabs": "sort", "agents": "sessions"}
+
+
+def available(sections):
+    return tuple(name for name in sections
+                 if name not in NEEDS or tooling.enabled(NEEDS[name]))
+
+
+def _tabs():
+    from . import tabs as tabs_mod  # imports herdr-sort's ledger; only when on
+    return tabs_mod.view()
 
 
 def _safe(fn, *args):
@@ -38,10 +53,13 @@ def _herdr_side():
     spaces = herdr_mod.workspace_labels(snap)
     pane_workspace = {pane_id: spaces.get(pane.get("workspace_id"), "")
                       for pane_id, pane in panes.items()}
-    try:
-        rows = agents_mod.rows(terminals)
-    except Exception as err:
-        rows = f"{type(err).__name__}: {err}"
+    if not tooling.enabled("sessions"):
+        rows = []
+    else:
+        try:
+            rows = agents_mod.rows(terminals)
+        except Exception as err:
+            rows = f"{type(err).__name__}: {err}"
     titles = {}
     if not isinstance(rows, str):
         titles = {row["terminal_id"]: row.get("title") or row.get("pane")
@@ -52,8 +70,8 @@ def _herdr_side():
 
 
 def collect(sections=None):
-    wanted = set(sections or ("tabs", "memory", "worktrees", "index", "agents", "keys",
-                              "notes"))
+    wanted = set(available(sections or ("tabs", "memory", "worktrees", "index", "agents",
+                                        "keys", "notes")))
     model = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         jobs = {}
@@ -66,7 +84,7 @@ def collect(sections=None):
         if "worktrees" in wanted:
             jobs["worktrees"] = pool.submit(_safe, worktrees_mod.scan)
         if "tabs" in wanted:
-            jobs["tabs"] = pool.submit(_safe, tabs_mod.view)
+            jobs["tabs"] = pool.submit(_safe, _tabs)
         # Agents needs the snapshot, and the memory section wants its workspace
         # labels, so it runs whenever either is asked for.
         if {"agents", "memory", "notes"} & wanted:

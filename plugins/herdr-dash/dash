@@ -455,6 +455,10 @@ def main(argv):
     if args.help:
         print(__doc__.strip())
         return 0
+    # Drop sections whose component this machine does not run (tooling.toml).
+    args.sections = model_mod.available(args.sections)
+    args.collapsed = model_mod.available(args.collapsed)
+    args.brief = model_mod.available(args.brief)
     try:
         if "tui" == args.command:
             tui(tuple(args.sections), args.interval, set(args.collapsed),

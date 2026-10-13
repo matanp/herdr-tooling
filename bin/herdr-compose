@@ -28,9 +28,10 @@ PANES = os.path.join(STATE, "panes")
 DRAFTS = os.path.join(STATE, "drafts")
 HISTORY = os.path.join(STATE, "history.jsonl")
 LOG = os.path.join(STATE, "compose.log")
-NVIM_INIT = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                         "..", "share", "herdr-compose", "compose.lua")
-CCNAV = os.path.expanduser("~/.local/bin/ccnav-herdr")
+# Resolved through the symlink to the repo, where compose.lua sits beside bin/.
+HERE = os.path.dirname(os.path.realpath(__file__))
+NVIM_INIT = os.path.join(HERE, "..", "compose", "compose.lua")
+CCNAV = os.path.join(HERE, "ccnav-herdr")
 SPLIT_RATIO = 0.7
 PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
 
