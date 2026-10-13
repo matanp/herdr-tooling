@@ -13,6 +13,9 @@ $EDITOR ~/.config/herdr/tooling.toml          # pick components, set [dash] memo
 ~/.local/src/herdr-tooling/install
 ```
 
+Moving a machine set up the old way, by copying files by hand? Follow
+[`MIGRATING-linux.md`](MIGRATING-linux.md) instead.
+
 Each machine has two files of its own under `~/.config/herdr/`:
 
 | File | Holds |
