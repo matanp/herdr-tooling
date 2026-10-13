@@ -614,7 +614,8 @@ title = ["\\\\bdocs?\\\\b", "\\\\breadme\\\\b"]
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+    # Every subcommand acts on live tabs, so a help flag anywhere must not fall through.
+    if len(argv) < 2 or {"-h", "--help"} & set(argv[1:]):
         print(__doc__.strip())
         return 0
     command = argv[1]
