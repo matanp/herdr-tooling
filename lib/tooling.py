@@ -28,6 +28,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 #   plugin    repo plugin directory linked into ~/.local/share/herdr-plugins
 #   keys      fragment under config/keys/ appended to config.toml
 #   skill     repo skill directory linked into ~/.claude/skills
+#   hook      repo script linked into ~/.claude/hooks, run as a SessionStart hook
+#   hook_cmd  SessionStart hook command, for a tool already linked into ~/.local/bin
 #   requires  components that must also be on
 #   linux     reads /proc on its critical path; skipped elsewhere
 COMPONENTS = {
@@ -38,7 +40,8 @@ COMPONENTS = {
     "ccnav": {"bin": [("bin/ccnav-herdr", "ccnav-herdr")],
               "keys": "ccnav.toml", "requires": ["compose"], "linux": True},
     "sessions": {"bin": [("bin/herdr-sessions", "herdr-sessions")], "linux": True},
-    "sort": {"bin": [("bin/herdr-sort", "herdr-sort")], "plugin": "herdr-sort"},
+    "sort": {"bin": [("bin/herdr-sort", "herdr-sort")], "plugin": "herdr-sort",
+             "skill": "skills/close"},
     "dash": {"plugin": "herdr-dash", "keys": "dash.toml"},
     # Keys only: the prsessions plugin is installed outside this repo.
     "prsessions": {"keys": "prsessions.toml"},
@@ -46,6 +49,8 @@ COMPONENTS = {
     "space-scope": {"bin": [("plugins/space-scope/space-scope", "herdr-space-scope")],
                     "plugin": "space-scope", "keys": "space-scope.toml"},
     "brief-hook": {"hook": "hooks/herdr-project-brief.py"},
+    "tabname": {"bin": [("bin/herdr-tabname", "herdr-tabname")],
+                "hook_cmd": "herdr-tabname ensure >/dev/null 2>&1 || true"},
 }
 
 _cache = {}

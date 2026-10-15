@@ -33,14 +33,17 @@ after editing either file.
 
 | Component | Installs | Key | Platforms |
 |---|---|---|---|
+| `keys` | `bin/herdr-keys` → `~/.local/bin`, plugin `herdr-keys`; wraps every binding | — | linux (plugin) |
 | `compose` | `bin/herdr-compose` → `~/.local/bin` | `prefix+i` | linux, macos (needs nvim) |
 | `ccnav` | `bin/ccnav-herdr` → `~/.local/bin` | `prefix+u/d/f/a`, `prefix+shift+k/j` | linux (`/proc`); needs compose |
 | `sessions` | `bin/herdr-sessions` → `~/.local/bin` | — | linux (`/proc`) |
-| `sort` | `bin/herdr-sort`, plugin, seeds `sort-rules.toml` | — | linux; untested on macos |
-| `dash` | plugin `herdr-dash` | `prefix+m` | linux, macos (RSS by pane instead of PSS/cgroup) |
+| `sort` | `bin/herdr-sort`, plugin, `/close` skill → `~/.claude/skills`, seeds `sort-rules.toml` | — | linux; untested on macos |
+| `dash` | plugin `herdr-dash` | `prefix+m`, `prefix+shift+m` | linux, macos (RSS by pane instead of PSS/cgroup) |
+| `prsessions` | key only; the plugin is not in this repo | `prefix+t` | — |
 | `viewer` | plugin `viewer` | `prefix+shift+v`, `prefix+y` | linux, macos (needs `rich`) |
 | `space-scope` | plugin + `~/.local/bin/herdr-space-scope` | `prefix+shift+s` | linux, macos |
 | `brief-hook` | `~/.claude/hooks/herdr-project-brief.py`, registered in `~/.claude/settings.json` | — | linux, macos |
+| `tabname` | `bin/herdr-tabname` → `~/.local/bin`, its `ensure` registered as a SessionStart hook | — | linux, macos |
 
 Plugins are linked from `~/.local/share/herdr-plugins/<name>`. Shared Python
 (`toml_min`, `tooling`) lives in `lib/`, and the tools find it by resolving their
@@ -77,7 +80,9 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
   `Ctrl-S` sends. `prefix+shift+k/j` scroll the agent.
 - **`herdr-keys`** — keybinding usage. `stats [--since 7d]`: per-binding counts, never-used
   custom bindings, and built-in actions (tab/space/pane switches, splits, closes, zoom).
-  - Custom bindings are exact: each `[[keys.command]]` runs `herdr-keys run KEY -- CMD`.
+  - Custom bindings are exact: while `keys` is on, `install` writes each `[[keys.command]]`
+    as `herdr-keys run KEY -- CMD`, with the key after any `[keys]` remap. With it off the
+    bindings run unwrapped and uncounted.
   - Built-ins are inferred from the event stream by the `herdr-keys` plugin's startup
     watcher, so mouse and API calls count too. Log in `~/.local/state/herdr-keys/keys.jsonl`.
   - Culling is counted from herdr-sort's close ledger; `cull start` / `cull closed` lines in
@@ -120,12 +125,13 @@ that workspace's `[[brief]]` from `tooling.toml` (or, when there are none, its `
 `sort-rules.toml`) as context, so an unqualified prompt resolves
 to the right project. Silent on every failure path.
 
-`herdr-tabname ensure >/dev/null 2>&1 || true`, as a second `SessionStart` command, keeps the
-tab-label daemon running across reboots and herdr restarts, and hands it `ANTHROPIC_BASE_URL`.
+`herdr-tabname ensure >/dev/null 2>&1 || true`, as a second `SessionStart` command (registered
+by the `tabname` component), keeps the tab-label daemon running across reboots and herdr
+restarts, and hands it `ANTHROPIC_BASE_URL`.
 
 ## Claude Code skill
 
-`/close` — the in-session counterpart of `herdr-sort cull`. Checks the session's open items
+`/close` (installed with `sort`) — the in-session counterpart of `herdr-sort cull`. Checks the session's open items
 live, pushes back while any are still the session's to finish, otherwise ends on a close report
 and `herdr-sort close --as <d> --self` for this pane. User-invoked only.
 

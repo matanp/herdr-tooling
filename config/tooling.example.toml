@@ -11,6 +11,7 @@ dash        = true    # prefix+m / prefix+shift+m  dashboard popup / split tab
 space-scope = true    # prefix+shift+s  Agents panel scope toggle
 prsessions  = false   # prefix+t  key only; the prsessions plugin is not in this repo
 brief-hook  = true    # Claude SessionStart hook injecting [[brief]] below
+tabname     = true    # tab labels follow the agent's session title; Claude SessionStart hook
 sort        = false   # herdr-sort daemon + close ledger (sort-rules.toml)
 sessions    = false   # herdr-sessions table; Linux only (/proc)
 ccnav       = false   # turn navigation + compose scroll keys; Linux only (/proc)
