@@ -9,7 +9,7 @@ usage: dash [command] [options]
   close-popup      dismiss it
 
 options:
-  --sections a,b   which sections, in order (default all six)
+  --sections a,b   which sections, in order (default all)
   --collapsed a,b  start these folded; z unfolds
   --brief a,b      render these as a summary line only
   --interval SECS  refresh floor (default 5)
@@ -35,7 +35,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dashlib import herdr as herdr_mod
 from dashlib import model as model_mod
 from dashlib import notes as notes_mod
+from dashlib import reap
 from dashlib import render
+from dashlib import reports as reports_mod
 
 PLUGIN_ID = "herdr-dash"
 ENTRYPOINT = "popup"   # the manifest pane whose placement is popup
@@ -239,8 +241,13 @@ class Tui:
         else:
             age = int(time.time() - stamp) if stamp else -1
             hints = [f"1-{len(self.order)} section", "z fold", "j/k move"]
+            if "reports" in self.order:
+                hints.append("enter answer report")
+                hints.append("Y yes to clean offers")
             if "agents" in self.order:
                 hints.append("enter focus pane")
+            if "memory" in self.order:
+                hints.append("x kill orphan")
             hints += ["n note", "e editor", "r refresh", "q quit"]
             text = (f" {time.strftime('%H:%M:%S', time.localtime(stamp))} "
                     f"({age}s ago)  │  " + " · ".join(hints))
@@ -251,8 +258,10 @@ class Tui:
         except self.curses.error:
             pass
 
-    def prompt(self, label):
+    def prompt(self, label, row=None, style=None):
         height, width = self.stdscr.getmaxyx()
+        row = height - 1 if row is None else row
+        style = self.curses.A_REVERSE if style is None else style
         buf = ""
         self.curses.curs_set(1)
         # The main loop leaves the window non-blocking; get_wch() would raise
@@ -262,10 +271,9 @@ class Tui:
             while True:
                 text = f" {label}{buf}"
                 try:
-                    self.stdscr.addnstr(height - 1, 0, text.ljust(width - 1),
-                                        width - 1, self.curses.A_REVERSE)
-                    self.stdscr.move(height - 1,
-                                     min(width - 2, len(text)))
+                    self.stdscr.addnstr(row, 0, text.ljust(width - 1),
+                                        width - 1, style)
+                    self.stdscr.move(row, min(width - 2, len(text)))
                 except self.curses.error:
                     pass
                 self.stdscr.refresh()
@@ -350,8 +358,12 @@ class Tui:
             if name:
                 self.collapsed ^= {name}
                 self.generation = -1
+        elif key == ord("Y"):
+            self.yes_to_clean()
         elif key in (ord("\n"), ord("\r"), curses.KEY_ENTER, 10, 13):
             line = self.cursor_line()
+            if line and "report" == line.target[0]:
+                return self.answer(line.target[1])
             if line and "agent" == line.target[0]:
                 pane = line.target[1].get("pane")
                 if pane and self.focus_pane(pane):
@@ -384,7 +396,165 @@ class Tui:
                 self.say("d deletes a note; move the cursor to one")
         elif key == ord("e"):
             self.editor()
+        elif key == ord("x"):
+            self.kill_orphans()
         return True
+
+    def _waiting(self):
+        data = self.refresher.snapshot()[0].get("reports")
+        return data["items"] if isinstance(data, dict) else []
+
+    def _send(self, item, text):
+        try:
+            reports_mod.herdr_close.say(herdr_mod.Herdr(PLUGIN_ID).call, item["pane_id"],
+                                        item["sid"], text)
+            return True
+        except Exception as err:
+            self.say(f"could not reach {item['title']}: {err}")
+            return False
+
+    def yes_to_clean(self):
+        clean = [i for i in self._waiting()
+                 if reports_mod.herdr_close.clean_offer(i["report"])
+                 and not (i["told_yes"] or i["stalled"] or i["blocked"])]
+        if not clean:
+            self.say("no clean close offers waiting")
+            return
+        answer = self.prompt(f"say yes to {len(clean)} clean offers? [y/N] ")
+        if (answer or "").strip().lower() not in ("y", "yes"):
+            self.say("nothing sent")
+            return
+        sent = sum(self._send(item, "yes") for item in clean)
+        self.say(f"said yes to {sent}; each closes its own tab", seconds=6)
+        self.refresher.refresh_now()
+
+    def answer(self, first):
+        """Walk the waiting reports from `first`: what is typed goes to that session, a bare
+        enter moves on. Returns False when the dash should exit (a jump)."""
+        seen, item = set(), first
+        while item:
+            seen.add(item["sid"])
+            waiting = self._waiting()
+            position = next((n for n, i in enumerate(waiting, 1)
+                             if i["sid"] == item["sid"]), 0)
+            text = self.card(item, position, len(waiting))
+            command = (text or "").strip()
+            if text is None or command in ("/quit", "/q"):
+                break
+            if command in ("/view", "/v"):
+                self.page(item["reply"])
+                continue
+            if command in ("/jump", "/j"):
+                if self.focus_pane(item["pane_id"]):
+                    return False
+                continue
+            if command in ("/leave", "/l"):
+                reports_mod.herdr_close.leave(item["sid"], item["replied_at"])
+            elif command and self._send(item, command):
+                self.say(f"sent to {item['title']}")
+            item = next((i for i in self._waiting() if i["sid"] not in seen), None)
+        else:
+            self.say("no more reports waiting")
+        self.refresher.refresh_now()
+        self.generation = -1
+        return True
+
+    def card(self, item, position, total):
+        """One report drawn at a fixed place, so the eye does not hunt for it."""
+        import textwrap
+        height, width = self.stdscr.getmaxyx()
+        wrap = max(30, width - 6)
+        rep = item["report"]
+        lines = []
+        recap = item.get("recap")
+        if recap:
+            age = f"{render._ago(time.time() - recap['at'])} ago" if recap.get("at") \
+                else "not built yet" if "fallback" == recap.get("source") else "age unknown"
+            lines.append((f"recap · {age}", "dim"))
+            lines += [(f"  {l}", "normal") for l in textwrap.wrap(recap["text"], wrap)[:4]]
+            if recap.get("needs"):
+                lines += [(f"  {l}", "warn")
+                          for l in textwrap.wrap(f"needs: {recap['needs']}", wrap)[:2]]
+            lines.append(("", "normal"))
+        lines.append((f"[{position or '?'} of {total}]  {item['title']}", "head"))
+        if item["blocked"]:
+            lines.append(("  waiting on a permission prompt: /jump answers it in the tab", "crit"))
+        if item["stalled"]:
+            lines.append((f"  {item['said'] or '/close'!r} never started: /jump to look", "warn"))
+        if item["told_yes"] and "offer" == rep["kind"]:
+            lines.append(("  told yes and still open; its reply says why", "warn"))
+        if item["said"] and item["said"] != reports_mod.herdr_close.CLOSE_PROMPT:
+            lines.append((render._clip(f"  you said: {item['said']}", width - 1), "dim"))
+        if "reply" == rep["kind"]:
+            body = [l for l in (item["reply"] or "(no reply)").strip().splitlines() if l.strip()]
+            shown = []
+            for line in body[-8:]:
+                shown += textwrap.wrap(line, wrap) or [""]
+            lines += [(f"  {l}", "normal") for l in shown[-10:]]
+        else:
+            head = rep["verdict"] or "(no verdict line)"
+            if rep["next"] and "offer" == rep["kind"]:
+                head += f" — next: {rep['next']}"
+            lines += [(f"  {l}", "normal") for l in textwrap.wrap(head, wrap)[:3]]
+            for result, text in rep["items"][:5]:
+                label = "FAIL" if "fail" == result.lower() else result
+                style = "crit" if "FAIL" == label else "dim"
+                for n, l in enumerate(textwrap.wrap(text, wrap - 8)[:2]):
+                    lines.append((f"  {label if 0 == n else '':<7} {l}", style))
+            ask = rep["ask"] if "keep" == rep["kind"] else rep["side"]
+            if ask:
+                lines += [(f"  {l}", "warn") for l in textwrap.wrap(ask, wrap)[:3]]
+        self.stdscr.erase()
+        for row, (text, style) in enumerate(lines[:max(1, height - 4)]):
+            try:
+                self.stdscr.addnstr(row, 0, text, width - 1, STYLES.get(style, 0))
+            except self.curses.error:
+                pass
+        row = min(len(lines), height - 4) + 1
+        try:
+            self.stdscr.addnstr(row + 2, 0, "  enter: next · /view · /jump · /leave · /quit",
+                                width - 1, STYLES.get("dim", 0))
+        except self.curses.error:
+            pass
+        return self.prompt("> ", row=row, style=0)
+
+    def page(self, text):
+        self.curses.endwin()
+        try:
+            subprocess.run(["less", "-R"], input=(text or "").encode(), check=False)
+        except OSError as err:
+            self.say(f"cannot run less: {err}")
+        self.stdscr.clear()
+        self.curses.doupdate()
+
+    def kill_orphans(self):
+        line = self.cursor_line()
+        if not line or "orphan" != line.target[0]:
+            self.say("x kills an orphaned pane; move the cursor to one")
+            return
+        pane_ids = line.target[1]
+        label = pane_ids[0] if 1 == len(pane_ids) else f"{len(pane_ids)} panes"
+        answer = self.prompt(f"kill every process of {label}? [y/N] ")
+        if (answer or "").strip().lower() not in ("y", "yes"):
+            self.say("kill cancelled")
+            return
+        self.say(f"killing {label}…", seconds=10)
+
+        def work():
+            try:
+                result = reap.kill(pane_ids)
+            except Exception as err:
+                self.say(f"kill refused: {err}")
+                return
+            message = f"{label}: SIGTERM {result['killed']}"
+            if result["forced"]:
+                message += f", SIGKILL {result['forced']}"
+            if result["skipped"]:
+                message += f" · back in herdr, spared: {', '.join(result['skipped'])}"
+            self.say(message, seconds=8)
+            self.refresher.refresh_now()
+
+        threading.Thread(target=work, daemon=True).start()
 
     def run(self):
         self.stdscr.timeout(250)

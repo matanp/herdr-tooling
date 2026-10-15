@@ -1,0 +1,19 @@
+id = "herdr-keys"
+name = "Keybinding usage"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Log built-in actions from the event stream for herdr-keys stats"
+platforms = ["linux"]
+
+[[startup]]
+command = ["./run", "watch"]
+
+[[actions]]
+id = "watch"
+title = "Keys: start usage watcher"
+command = ["./run", "watch"]
+
+[[actions]]
+id = "stop"
+title = "Keys: stop usage watcher"
+command = ["./run", "stop"]

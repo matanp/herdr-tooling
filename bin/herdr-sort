@@ -15,12 +15,31 @@ usage: herdr-sort <command> [options]
                        sort_from): same / elsewhere / stay, flagging moves undone by hand
 
   stale                KEEP / GLANCE / CLOSE for every open tab, with the reason
-  close --safe         close every CLOSE tab after one confirmation (--yes skips it)
-  close <pane|#>...    close these, whatever their verdict; pane ids or stale numbers
-  log [words]          closed sessions, newest first: summary, time, next step, id
+  close --as D <pane|#>...
+                       close these with a disposition D: done filed merged dropped trivial;
+                       done/filed/merged go to Linear first, and a Linear failure closes nothing
+  close --as D --self  close the calling pane ($HERDR_PANE_ID), focused or not: how a
+                       session closes itself once its close report is written
+  close --safe         the CLOSE group after one confirmation (--yes skips it): trivial
+                       ones as trivial, verified-done ones as done, the rest listed and
+                       left open; with --as D, all of it as D
+  cull                 walk every open tab: one sweep for trivial and verified-done tabs,
+                       then one card and one key per tab (or group sharing a PR/ticket/file).
+                       Optionally sends /close to chosen closeable Claude tabs first; their
+                       reports are answered from the dash's REPORTS section (prefix+m)
+  cull --space NAME    the same, for one space only (exact name or a unique substring)
+  popup [--space NAME] open `cull` as a herdr popup
+  loops                closed sessions whose next step went nowhere: clear the ones a
+                       later session resolved, then file / drop / mark trivial the rest
+  review [--since 7d]  closes in the window grouped by disposition, with Linear links
+  log [words]          closed sessions, newest first: summary, time, next step, disposition
   log --all [words]    every session on the box, not only closed ones
   reopen <id|#n|words> reopen a closed session in its old space
-  ledger [--summarize] re-index transcripts; --summarize fills Haiku summaries
+  ledger               re-index transcripts
+  records              refresh the session records of open tabs now (the daemon does this
+                       as agents settle, cron every 15 minutes), then list them
+  records --force      refresh every open session that grew at all, settled or not
+  records --audit      also run the audit tier (close note) for every open session
 
 options:
   --settle SECS        title must hold still this long (default 30; 0 for once/plan)
@@ -29,8 +48,17 @@ options:
   --foreground         daemon: do not detach
   --verbose            log skip reasons too
   -n N                 log: rows to show (default 15)
-  --limit N            ledger --summarize: cap the Haiku calls
+  --quiet              records: one summary line, for cron
+  --as D               close: disposition (done filed merged dropped trivial)
+  --ref ID             close: Linear issue to comment on (merged: the surviving tab's ticket)
+  --note TEXT          close: reason; required for dropped
+  --since AGE          review: window, e.g. 24h, 7d, 2w (default 7d)
   --sort-from A,B      replay: comma-separated sort_from to use instead of the rules file
+
+cull / loops keys:
+  d done (only when every check passes)  f file  m merge  x drop  t trivial  k keep
+  s skip (loops)  n note (saved per session, filed with the card)  j jump to tab
+  e edit draft in nvim  p project  w why  q quit
 """
 
 import fcntl
@@ -38,17 +66,27 @@ import json
 import datetime
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
+import termios
+import textwrap
 import threading
 import time
+import tty
 
 STATE_DIR = os.path.expanduser("~/.local/state/herdr-sort")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOCK_PATH = os.path.join(STATE_DIR, "daemon.lock")
 LOG_PATH = os.path.join(STATE_DIR, "sort.log")
 RULES_PATH = os.path.expanduser("~/.config/herdr/sort-rules.toml")
-sys.path.insert(0, os.path.expanduser("~/.local/share/herdr-plugins/herdr-sort"))
+_REPO_PLUGIN = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            "..", "plugins", "herdr-sort")
+sys.path.insert(0, _REPO_PLUGIN if os.path.isdir(_REPO_PLUGIN)
+                else os.path.expanduser("~/.local/share/herdr-plugins/herdr-sort"))
+import herdr_close  # noqa: E402
 import herdr_ledger as ledger  # noqa: E402
 
 EXPLICIT = re.compile(r"^\s*([A-Za-z][\w-]{0,15})\s*[:·]\s*(.+?)\s*$")
@@ -608,9 +646,10 @@ def daemon(herdr, args):
     lock.write(str(os.getpid()))
     lock.flush()
 
-    wake = threading.Event()
+    wake, records_wake = threading.Event(), threading.Event()
     types = ["tab.created", "tab.renamed", "tab.closed", "pane.created", "pane.updated",
-             "pane.moved", "pane.closed", "workspace.created", "workspace.renamed"]
+             "pane.moved", "pane.closed", "workspace.created", "workspace.renamed",
+             "pane.agent_status_changed"]
 
     def reader():
         # The stream replays backlog on connect, so events are only a wake-up:
@@ -619,11 +658,13 @@ def daemon(herdr, args):
             try:
                 for _ in herdr.events(types):
                     wake.set()
+                    records_wake.set()
             except (OSError, SystemExit) as err:
                 log(f"event stream dropped ({err}); reconnecting in 5s")
             time.sleep(5)
 
     threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=records_loop, args=(records_wake,), daemon=True).start()
     log(f"daemon start pid={os.getpid()} settle={args['settle']}s socket={herdr.path}")
     state = load_state()
     titles_seen = {}
@@ -646,6 +687,34 @@ def daemon(herdr, args):
         except SystemExit as err:
             log(f"fatal: {err}")
             raise
+
+
+RECORDS_TICK_S = 20
+
+
+def records_loop(wake):
+    """Session records beside the sort loop. An agent that went idle is refreshed once its
+    transcript has been quiet for SETTLE_S, so this re-checks on a tick, not only on the
+    status event; records.refresh makes no model call while nothing has settled or grown."""
+    try:
+        recs, llm = _records()
+    except ImportError as err:
+        log(f"records off: {err}")
+        return
+    model = llm.ClaudeLLM()
+    while True:
+        wake.wait(timeout=RECORDS_TICK_S)
+        wake.clear()
+        now = time.time()
+        try:
+            _, _, store = recs.sweep(model, now)
+        except Exception as err:  # noqa: BLE001 -- the sort loop must outlive this thread
+            log(f"records error: {type(err).__name__}: {err}")
+        else:
+            built = [r.get("title") or k for k, r in store.items() if r.get("built_at") == now]
+            if built:
+                log(f"records refreshed {len(built)}: " + ", ".join(shorten(t, 30) for t in built))
+        time.sleep(5)
 
 
 DEFAULT_RULES = '''# herdr-sort rules -- first match wins.
@@ -678,7 +747,8 @@ title = ["\\\\bdocs?\\\\b", "\\\\breadme\\\\b"]
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+    # Every subcommand acts on live tabs, so a help flag anywhere must not fall through.
+    if len(argv) < 2 or {"-h", "--help"} & set(argv[1:]):
         print(__doc__.strip())
         return 0
     command = argv[1]
@@ -688,16 +758,18 @@ def main(argv):
     i = 2
     while i < len(argv):
         token = argv[i]
-        if token in ("--settle", "--max-moves", "--rules", "-n", "--limit", "--sort-from"):
+        if token in ("--settle", "--max-moves", "--rules", "-n",
+                     "--as", "--ref", "--note", "--since", "--space", "--sort-from"):
             if i + 1 >= len(argv):
                 raise SystemExit(f"herdr-sort: {token} needs a value")
             key = token.lstrip("-").replace("-", "_")
-            text_valued = ("--rules", "--sort-from")
+            text_valued = ("--rules", "--as", "--ref", "--note", "--since", "--space",
+                           "--sort-from")
             args[key] = argv[i + 1] if token in text_valued else int(argv[i + 1])
             i += 2
             continue
         if token in ("--foreground", "--verbose", "--init", "--safe", "--yes", "--all",
-                     "--summarize", "--json"):
+                     "--summarize", "--json", "--self", "--force", "--audit", "--quiet"):
             args[token.lstrip("-")] = True
             i += 1
             continue
@@ -852,40 +924,95 @@ def _confirm(prompt):
 
 
 def cmd_close(args, rest):
+    disposition = args.get("as")
+    if disposition is not None and disposition not in CLOSE_AS:
+        raise SystemExit(f"herdr-sort: --as takes one of {', '.join(CLOSE_AS)}")
+    if "dropped" == disposition and not (args.get("note") or "").strip():
+        raise SystemExit('herdr-sort: --as dropped needs --note "why it was abandoned"')
+    if "merged" == disposition and not args.get("ref"):
+        raise SystemExit("herdr-sort: --as merged needs --ref <the surviving tab's ticket>")
+    if args.get("self"):
+        if args.get("safe") or rest:
+            raise SystemExit("herdr-sort: --self closes only the calling pane; "
+                             "drop --safe and the targets")
+        if not disposition:
+            raise SystemExit("herdr-sort: --self needs --as")
+        if not os.environ.get("HERDR_PANE_ID"):
+            raise SystemExit("herdr-sort: --self needs HERDR_PANE_ID; not running inside herdr")
+        # A moved pane gets a new pane_id but keeps its spawn-time HERDR_PANE_ID;
+        # herdr still resolves the old id, and terminal_id survives the move.
+        env_id = os.environ["HERDR_PANE_ID"]
+        try:
+            rest = [ledger.call("pane.get", {"pane_id": env_id})["pane"]["terminal_id"]]
+        except RuntimeError:
+            rest = [env_id]
+    if not args.get("safe"):
+        if not rest:
+            raise SystemExit("herdr-sort: close needs --safe or pane ids / stale numbers")
+        if not disposition:
+            raise SystemExit(
+                "herdr-sort: close needs a disposition: --as done|filed|merged|dropped|trivial\n"
+                "  done/filed record the outcome or next step in Linear, merged comments on\n"
+                "  --ref, trivial files nothing, dropped needs --note. `cull` walks them instead.")
     rows, index = ledger.assess()
     rows = _numbered_stale(rows)
     if args.get("safe"):
         chosen = [r for r in rows if "CLOSE" == r["verdict"]]
-    elif rest:
+    else:
         chosen = []
         for target in rest:
             match = next((r for r in rows if target in (r["pane_id"], r["terminal_id"])
                           or target.lstrip("#") == str(r["n"])), None)
             if not match:
                 raise SystemExit(f"herdr-sort: no open tab {target!r} (numbers come from `stale`)")
+            if args.get("self"):
+                # The focus guard stops a user closing the tab they are looking at by
+                # mistake. --self is that tab's own session asking, so it is lifted for
+                # this row only; the empty-space guard still applies.
+                match["focused"] = False
             chosen.append(match)
-    else:
-        raise SystemExit("herdr-sort: close needs --safe or pane ids / stale numbers")
     if not chosen:
         print("nothing to close")
         return 0
-    for row in chosen:
-        print(f"  {shorten(row['workspace'], 19):<19} "
-              f"{shorten(row['title'] or '(shell)', 46):<46} {row['verdict']}")
-    if not args.get("yes") and not _confirm(f"close these {len(chosen)} tabs? [y/N] "):
+    cards, linear, _ = _assess(chosen, index, [], all_rows=rows)
+    cards = [c for c in cards if "open" == c["kind"]]
+    plan, left = [], []
+    for card in cards:
+        if disposition:
+            plan.append((card, disposition))
+        elif card.get("trivial"):
+            plan.append((card, "trivial"))
+        elif card.get("done_ok"):
+            plan.append((card, "done"))
+        else:
+            left.append(card)
+    for card, chosen_as in plan:
+        why = card.get("trivial") or (card.get("note") or {}).get("outcome") or ""
+        print(f"  {chosen_as:<8} {_card_line(card)} {shorten(why, 60)}")
+    if left:
+        print("\nleft open, each needs a decision (`herdr-sort cull`, or close --as):")
+        for card in left:
+            print(f"  {card.get('suggested') or '?':<8} {_card_line(card)} {_undecided(card)}")
+    if not plan:
+        return 0
+    if not args.get("yes") and not _confirm(f"close these {len(plan)} as shown? [y/N] "):
         print("nothing closed")
         return 1
-    done = ledger.close(chosen, index)
-    for row in chosen:
-        if row.get("skipped"):
-            print(f"  kept {shorten(row['title'] or '(shell)', 46)}: {row['skipped']}")
-    log(f"closed {len(done)} tabs")
-    print(f"closed {len(done)}; `herdr-sort log` lists them, `herdr-sort reopen <n>` restores one")
+    closer = _Closer(rows, index, linear)
+    for card, chosen_as in plan:
+        decision = _decision(chosen_as, note=args.get("note"), ref=args.get("ref"))
+        if "failed" == closer.apply(card, decision):
+            print("stopping; the rest stay open")
+            break
+    log(f"closed {closer.closed} tabs")
+    print(f"closed {closer.closed}; `herdr-sort log` lists them, "
+          "`herdr-sort reopen <n>` restores one")
     return 0
 
 
 def cmd_log(args, rest):
-    index = ledger.load_index()
+    recs, _ = _records()
+    index, store = ledger.load_index(), recs.load()
     words = [w.lower() for w in rest]
 
     # Whole words, prefix-matched: "oa" must not hit "dashboard", but "expan" still
@@ -900,12 +1027,13 @@ def cmd_log(args, rest):
         index, _ = ledger.sync(index)
         rows = sorted(index.values(), key=lambda r: -(r.get("last") or 0))
         rows = [(None, r) for r in rows if r.get("prompts") and hit(
-            r.get("title"), r.get("first_ask"), r.get("recap"), r.get("summary"))]
+            r.get("title"), r.get("first_ask"), r.get("recap"), r.get("summary"),
+            (store.get(r["key"]) or {}).get("recap"))]
     else:
         events = list(reversed(ledger.closes()))
         rows = [(n, e) for n, e in enumerate(events, 1)]
         rows = [(n, e) for n, e in rows if hit(
-            e.get("title"), e.get("workspace"),
+            e.get("title"), e.get("workspace"), (e.get("record") or {}).get("recap"),
             *[(index.get(e.get("key") or "") or {}).get(k) for k in ("recap", "summary", "first_ask")])]
     if not rows:
         print("no sessions match" if words else
@@ -918,12 +1046,23 @@ def cmd_log(args, rest):
         head = f"#{n:<3}" if n is not None else "    "
         closed = f"  closed {_day(item['closed_at'])}" if n is not None else ""
         print(f"{head} {shorten(title, 58):<58} {shorten(where or '', 20)}{closed}")
+        if n is not None and item.get("disposition"):
+            print(f"     {_disposition_line(item)}")
         if rec:
-            text, source = ledger.summary_of(rec)
+            if n is not None:
+                text, source = recs.closed_view(item, rec)
+                frozen = item.get("record") or {}
+            else:
+                live = recs.view(rec["key"], store)
+                text, source = ((live["text"], "record") if live
+                                else ledger.summary_of(rec))
+                frozen = store.get(rec["key"]) or {}
+            step = frozen.get("next_step") or rec.get("next_step")
             print(f"     {_stats(rec)}")
-            print(f"     {shorten(text, 150)}" + ("" if "recap" == source else f"  [{source}]"))
-            if rec.get("next_step") and rec["next_step"] not in text:
-                print(f"     {shorten(rec['next_step'], 150)}")
+            print(f"     {shorten(text, 150)}"
+                  + ("" if source in ("record", "recap") else f"  [{source}]"))
+            if step and step not in text:
+                print(f"     next: {shorten(step, 144)}")
             print(f"     {rec.get('resume')}")
         elif n is not None:
             print(f"     shell in {item.get('cwd')}; scrollback {item.get('scrollback') or 'empty'}")
@@ -940,26 +1079,869 @@ def cmd_reopen(args, rest):
         print("several match; pick one by id:")
         for e in hits[:10]:
             print(f"  {(e.get('key') or ':').split(':', 1)[1][:8]}  {e.get('title')}")
+            text = _closed_recap(e)
+            if text:
+                print(f"            {shorten(text, 110)}")
         return 1
     pane, space = ledger.reopen(hits[0])
     print(f"reopened {hits[0].get('title')!r} in {space!r} ({pane})")
+    text = _closed_recap(hits[0])
+    if text:
+        print(_wrap("recap", text))
     return 0
+
+
+def _closed_recap(event):
+    rec = ledger.load_index().get(event.get("key") or "")
+    return _records()[0].closed_view(event, rec)[0]
 
 
 def cmd_ledger(args, rest):
     index, parsed = ledger.sync()
     print(f"indexed {len(index)} sessions ({parsed} re-parsed)")
     if args.get("summarize"):
-        pending = sum(ledger.needs_summary(r) for r in index.values())
-        cap = args.get("limit") or pending
-        print(f"summarizing {min(cap, pending)} of {pending} with {ledger.SUMMARY_MODEL}")
-        done, failed = ledger.summarize(index, limit=args.get("limit"), progress=print)
-        print(f"summarized {done}, failed {failed}")
+        print("--summarize is retired: open sessions keep a live record (`herdr-sort records`), "
+              "and a close freezes it into the ledger")
+        return 1
+    return 0
+
+
+def cmd_records(args, rest):
+    recs, llm = _records()
+    now = time.time()
+    rows = ledger.live_panes()
+    audit = set()
+    if args.get("audit"):
+        audit = {r["key"] for r in rows if r.get("key") and r.get("agent") in recs.AGENTS}
+    _, index, store = recs.sweep(llm.ClaudeLLM(), now, audit=audit,
+                                 force=bool(args.get("force")), rows=rows)
+    open_keys = [r["key"] for r in rows if r.get("key") in store]
+    built = sum(store[k].get("built_at") == now for k in open_keys)
+    audited = sum(store[k].get("audit_at") == now for k in open_keys)
+    failed = sum(store[k].get("failed_at") == now for k in open_keys)
+    summary = (f"{len(open_keys)} open sessions: refreshed {built}, audited {audited}, "
+               f"failed {failed}")
+    if args.get("quiet"):
+        print(f"{datetime.datetime.now():%Y-%m-%d %H:%M} {summary}")
+        return 1 if failed else 0
+    if args.get("json"):
+        print(json.dumps({k: store[k] for k in open_keys}, indent=1))
+        return 0
+    print(summary)
+    by_key = {r["key"]: r for r in rows if r.get("key")}
+    for key in sorted(open_keys, key=lambda k: -(store[k].get("built_at") or 0)):
+        record, row = store[key], by_key[key]
+        age = (f"{ledger.human(now - record['built_at'])} ago" if record.get("built_at")
+               else "no record yet")
+        title = shorten(record.get("title") or row["title"] or "?", 50)
+        print(f"\n{shorten(row['workspace'], 19):<19} {title:<50} "
+              f"{row.get('status') or '?':<8} {age}")
+        view = recs.view(key, store, index.get(key))
+        if view:
+            print(_wrap("recap", view["text"]))
+        if view and view.get("needs"):
+            print(_wrap("needs", view["needs"]))
+        if view and view.get("next_step"):
+            print(_wrap("next", view["next_step"]))
+        if record.get("error"):
+            print(_wrap("error", record["error"]))
+    return 1 if failed else 0
+
+
+# --- dispositions: close --as, cull, loops, review ---------------------------
+
+CLOSE_AS = ("done", "filed", "merged", "dropped", "trivial")
+NOTES_PATH = os.path.join(ledger.STATE_DIR, "notes.json")
+TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+(?:#\S+)?$")
+REMARKS_PATH = os.path.join(ledger.STATE_DIR, "remarks.json")
+CARD_ITEMS = 6
+CULL_KEYS = {"d": "done", "f": "file", "m": "merge", "x": "drop", "t": "trivial",
+             "k": "keep", "n": "note", "j": "jump", "e": "edit", "p": "project", "w": "why",
+             "q": "quit"}
+LOOP_KEYS = {"f": "file", "x": "drop", "t": "trivial", "s": "skip", "n": "note", "e": "edit",
+             "p": "project", "w": "why", "q": "quit"}
+
+
+def _cull():
+    # Imported on first use: the daemon runs this same file, and must keep
+    # sorting when the installed plugin dir predates these modules.
+    import herdr_cull
+    import herdr_llm
+    return herdr_cull, herdr_llm
+
+
+def _records():
+    import herdr_llm
+    import herdr_records
+    return herdr_records, herdr_llm
+
+
+def _load_notes():
+    try:
+        with open(NOTES_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_notes(notes):
+    # One tmp per writer: a batch of tabs closing themselves runs this concurrently, and a
+    # shared tmp name lets one process replace away the file another is still writing.
+    os.makedirs(ledger.STATE_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="notes.", suffix=".tmp", dir=ledger.STATE_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(notes, handle)
+    os.replace(tmp, NOTES_PATH)
+
+
+def _load_remarks():
+    try:
+        with open(REMARKS_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _card_remark(card, remarks):
+    return next((remarks[m["key"]] for m in card["members"] if m.get("key") in remarks), None)
+
+
+def _save_remark(card, remarks, text):
+    for member in card["members"]:
+        if not member.get("key"):
+            continue
+        if text:
+            remarks[member["key"]] = text
+        else:
+            remarks.pop(member["key"], None)
+    os.makedirs(ledger.STATE_DIR, exist_ok=True)
+    tmp = REMARKS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(remarks, handle)
+    os.replace(tmp, REMARKS_PATH)
+
+
+def _assess(rows, index, closes, all_rows=None):
+    """Cards for rows and closes. An open tab's close note is its session record's audit,
+    reused while the transcript has not moved; notes.json still caches the loops' notes.
+    all_rows is every open pane, so a cull of one space does not freeze the others."""
+    cull, llm = _cull()
+    recs, _ = _records()
+    linear, model = llm.ClaudeLinear(), llm.ClaudeLLM()
+    notes = _load_notes()
+    started = time.time()
+
+    def progress(text):
+        print(f"  {int(time.time() - started):>4}s  {text}", flush=True)
+
+    store = recs.load()
+    if rows:
+        audit = {r["key"] for r in rows if r.get("key") in index
+                 and not cull._trivial(r, index[r["key"]])}
+        fresh = sum((store.get(k) or {}).get("audit_for") == index[k].get("size") for k in audit)
+        print(f"auditing {len(audit) - fresh} sessions ({fresh} fresh audits reused)", flush=True)
+        store = recs.save(recs.refresh(all_rows or rows, index, store, model, started,
+                                       audit=audit, progress=progress), now=started)
+        for key in audit:
+            record = store.get(key) or {}
+            if record.get("audit") and record.get("audit_for") == index[key].get("size"):
+                notes[key] = {"size": index[key].get("size"), "note": record["audit"]}
+    try:
+        cards = cull.assess(rows, index, closes, model, started, notes=notes,
+                            probe=cull.RealProbe(linear=linear), progress=progress)
+    finally:
+        _save_notes(notes)
+    for card in cards:
+        card["recap"] = _card_recap(card, store, index)
+    print(f"{len(cards)} cards in {int(time.time() - started)}s\n", flush=True)
+    return cards, linear, model
+
+
+def _card_recap(card, store, index):
+    """The newest member's record; a loop's is the one frozen into its close event."""
+    recs, _ = _records()
+    member = max(card["members"], key=lambda m: (m.get("rec") or {}).get("last") or 0)
+    if "loop" == card["kind"]:
+        text, source = recs.closed_view(member.get("event"), member.get("rec"))
+        frozen = (member.get("event") or {}).get("record") or {}
+        return {"text": text, "source": source, "at": frozen.get("built_at"),
+                "needs": None} if text else None
+    return recs.view(member.get("key"), store, index.get(member.get("key") or ""))
+
+
+def _decision(disposition, draft=None, note=None, ref=None):
+    draft = draft or {}
+    edited = draft.get("edited")
+    return {"disposition": disposition, "note": note, "ref": ref, "remark": draft.get("remark"),
+            "project": draft.get("project"), "title": draft.get("title") if edited else None,
+            "body": draft.get("body") if edited else None}
+
+
+class _Closer:
+    """Records a decision, then closes its tabs or resolves its closed sessions.
+
+    ledger.close counts a space's tabs from each row's snapshot count, which is
+    stale once an earlier card in the same walk closed tabs there; without the
+    running count here, two separate closes can empty and delete a space. The
+    same check runs before record, so Linear is never written for a tab that
+    ledger.close would then refuse to close.
+    """
+
+    def __init__(self, rows, index, linear):
+        self.index, self.linear = index, linear
+        self.records = _records()[0]
+        self.remaining = {r["workspace_id"]: r["workspace_panes"] for r in rows}
+        self.closed, self.resolved, self.done_ids = 0, 0, set()
+
+    def blocked(self, card):
+        per_space = {}
+        for member in card["members"]:
+            row = member.get("row")
+            if not row:
+                continue
+            if row.get("focused"):
+                return f"{shorten(row['title'] or '(shell)', 40)!r} is the tab you're in"
+            per_space[row["workspace_id"]] = per_space.get(row["workspace_id"], 0) + 1
+            if self.remaining.get(row["workspace_id"], 0) - per_space[row["workspace_id"]] < 1:
+                return f"it would empty {row['workspace']!r}, which deletes the space"
+        return None
+
+    def apply(self, card, decision):
+        """'ok', 'blocked' (nothing written), or 'failed' (Linear refused; nothing closed)."""
+        cull, llm = _cull()
+        if "open" == card["kind"]:
+            reason = self.blocked(card)
+            if reason:
+                print(f"  not closing: {reason}")
+                return "blocked"
+        try:
+            fields = cull.record(card, decision, self.linear, time.time())
+        except llm.LinearError as err:
+            print(f"  Linear refused it; nothing recorded, nothing closed:\n    {err}")
+            if cull.FALLBACK_PROJECT in str(err):
+                print(f"    (create the {cull.FALLBACK_PROJECT!r} project in Linear, "
+                      "or pick another with p)")
+            return "failed"
+        except (RuntimeError, ValueError, OSError) as err:
+            print(f"  nothing recorded, nothing closed: {err}")
+            return "failed"
+        ref = next((f["ref"] for f in fields if f.get("ref")), None)
+        if "loop" == card["kind"]:
+            for item in fields:
+                ledger.append_resolution(item["key"], item["closed_at"], item)
+            self.resolved += len(fields)
+            self.done_ids.add(card["id"])
+            print(f"  {decision['disposition']}" + (f" -> {ref}" if ref else ""))
+            return "ok"
+        rows = [m["row"] for m in card["members"] if m.get("row")]
+        for row in rows:
+            row["workspace_panes"] = self.remaining[row["workspace_id"]]
+        extra = {f["pane_id"]: f for f in fields if f.get("pane_id")}
+        store = self.records.load()
+        frozen = {r["key"]: self.records.close_fields(r["key"], store)
+                  for r in rows if r.get("key")}
+        done = ledger.close(rows, self.index, extra=extra, records=frozen)
+        for row in rows:
+            if row.get("skipped"):
+                print(f"  kept {shorten(row['title'] or '(shell)', 46)}: {row['skipped']}")
+            else:
+                self.remaining[row["workspace_id"]] -= 1
+        self.closed += len(done)
+        self.done_ids.add(card["id"])
+        print(f"  {decision['disposition']}" + (f" -> {ref}" if ref else "")
+              + f"; closed {len(done)} of {len(rows)}")
+        return "ok"
+
+
+def _card_line(card):
+    return f"{shorten(card.get('workspace') or '', 19):<19} {shorten(card['title'], 46):<46}"
+
+
+def _undecided(card):
+    if card.get("note_error"):
+        return f"no draft: {shorten(card['note_error'], 50)}"
+    failing = [i for i in card.get("open_items") or [] if "fail" == i.get("result")]
+    if failing:
+        return f"{len(failing)} failing check(s): {shorten(failing[0].get('text') or '', 40)}"
+    return shorten((card.get("note") or {}).get("next_step") or "", 60)
+
+
+def _disposition_line(event):
+    parts = [event["disposition"]]
+    if event.get("ref"):
+        parts.append(event["ref"])
+    if event.get("ref_url"):
+        parts.append(event["ref_url"])
+    line = " ".join(parts)
+    return f"{line} · {shorten(event['note'], 100)}" if event.get("note") else line
+
+
+def _tickets(card):
+    found = [i["id"] for i in (card.get("artifacts") or {}).get("issues") or [] if i.get("id")]
+    for ident in (card.get("note") or {}).get("issues") or []:
+        if ident not in found:
+            found.append(ident)
+    return found
+
+
+def _next_step(card):
+    note = card.get("note") or {}
+    if note.get("next_step"):
+        return note["next_step"]
+    return next(((m.get("rec") or {}).get("next_step") for m in card["members"]
+                 if (m.get("rec") or {}).get("next_step")), None)
+
+
+def _wrap(label, text, indent=11):
+    width = max(60, shutil.get_terminal_size((100, 40)).columns - 2)
+    lead = f"  {label:<{indent - 2}}"
+    return textwrap.fill(" ".join(str(text).split()), width, initial_indent=lead,
+                         subsequent_indent=" " * indent)
+
+
+def _shown_items(card):
+    """Failing first, then manual; passed checks need no decision and are left out."""
+    seen, out = set(), []
+    for item in card.get("open_items") or []:
+        key = " ".join((item.get("text") or "").lower().split())
+        if "pass" == item.get("result") or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return sorted(out, key=lambda i: 0 if "fail" == i.get("result") else 1)
+
+
+def _counted(label, states):
+    if not states:
+        return None
+    tally = {}
+    for state in states:
+        tally[state] = tally.get(state, 0) + 1
+    return f"{label}: " + ", ".join(f"{n} {s}" for s, n in tally.items())
+
+
+def _landed(arts):
+    prs = [f"PR {p['pr']} {p.get('state') or '?'}" for p in arts.get("prs") or []]
+    docs = [f"{d['path']} {'present' if d.get('exists') else 'MISSING'}"
+            for d in arts.get("docs") or []]
+    issues = [f"{i['id']} {i.get('state') or '?'}" for i in arts.get("issues") or []]
+    if len(prs) + len(docs) + len(issues) <= 6:
+        return " · ".join(prs + docs + issues)
+    parts = [
+        _counted("PRs", [p.get("state") or "?" for p in arts.get("prs") or []]),
+        _counted("docs", ["present" if d.get("exists") else "MISSING"
+                          for d in arts.get("docs") or []]),
+        _counted("issues", [i.get("state") or "?" for i in arts.get("issues") or []]),
+    ]
+    return " · ".join(p for p in parts if p)
+
+
+def _print_card(card, n, total, draft):
+    note = card.get("note") or {}
+    print(f"\n[{n}/{total}] {card['title']}")
+    where = card.get("workspace") or ""
+    if "loop" == card["kind"]:
+        closed = [(m.get("event") or {}).get("closed_at") for m in card["members"]]
+        where += f" · closed {_day(max(c for c in closed if c))}" if any(closed) else ""
+    print(f"  {where}")
+    recap = card.get("recap")
+    if recap:
+        age = (f" ({ledger.human(time.time() - recap['at'])} ago)" if recap.get("at")
+               else "" if "record" == recap.get("source") else " (no record yet)")
+        print(_wrap("recap", recap["text"] + age))
+        if recap.get("needs"):
+            print(_wrap("needs", recap["needs"]))
+    if len(card["members"]) > 1:
+        for m in card["members"]:
+            row, rec = m.get("row") or {}, m.get("rec") or {}
+            print(f"    tab  {shorten(row.get('title') or rec.get('title') or '?', 50):<50} "
+                  f"{shorten(row.get('workspace') or '', 18)}")
+    if draft.get("remark"):
+        print(_wrap("you said", draft["remark"]))
+    if card.get("trivial"):
+        print(_wrap("trivial", card["trivial"]))
+    if card.get("note_error"):
+        print(_wrap("no draft", card["note_error"]))
+    if note.get("outcome"):
+        print(_wrap("outcome", note["outcome"]))
+    if _next_step(card):
+        print(_wrap("next", _next_step(card)))
+    items = _shown_items(card)
+    for item in items[:CARD_ITEMS]:
+        result = {"fail": "FAIL"}.get(item.get("result"), item.get("result") or "?")
+        detail = f" ({item['detail']})" if item.get("detail") else ""
+        print(_wrap(f"  {result}", f"{item.get('kind')}: {item.get('text')}{detail}"))
+    if len(items) > CARD_ITEMS:
+        print(f"           … {len(items) - CARD_ITEMS} more open items (e shows all)")
+    landed = _landed(card.get("artifacts") or {})
+    if landed:
+        print(_wrap("landed", landed))
+    project = draft.get("project") or card.get("project") or _cull()[0].FALLBACK_PROJECT
+    suggest = card.get("suggested") or "-"
+    if card.get("done_ok"):
+        suggest += " (verified)"
+    print(_wrap("suggest", f"{suggest} · project {project}"))
+    edited = draft.get("edited")
+    title = draft["title"] if edited else note.get("draft_title")
+    body = draft["body"] if edited else note.get("draft_body")
+    if title:
+        print(_wrap("draft", title))
+        lines = (body or "").strip().splitlines()
+        for line in lines[:12]:
+            print(f"           {shorten(line, 110)}")
+        if len(lines) > 12:
+            print(f"           … {len(lines) - 12} more lines (e to read and edit)")
+
+
+def _line(prompt):
+    try:
+        handle = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+    except OSError:
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+    with handle:
+        print(prompt, end="", flush=True)
+        return handle.readline().strip()
+
+
+def _yes(prompt):
+    return _line(prompt).lower() in ("y", "yes")
+
+
+def _key(prompt, allowed):
+    while True:
+        print(prompt, end="", flush=True)
+        try:
+            fd = os.open("/dev/tty", os.O_RDONLY)
+        except OSError:
+            fd = None
+        if fd is None or not os.isatty(fd):
+            if fd is not None:
+                os.close(fd)
+            try:
+                ch = input().strip().lower()[:1]
+            except EOFError:
+                return "q"
+        else:
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = os.read(fd, 4).decode("utf-8", "replace")[:1]
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                os.close(fd)
+            print(ch if ch.isprintable() else "")
+            if "\x03" == ch:
+                raise KeyboardInterrupt
+            ch = "q" if ch in ("\x04", "\x1b") else ch.lower()
+        if ch in allowed:
+            return ch
+        print("  keys: " + "  ".join(f"{k} {v}" for k, v in allowed.items()))
+
+
+def _edit_draft(card, draft):
+    if draft.get("title") is None:
+        seed = "done" if "done" == card.get("suggested") else "filed"
+        draft.update(_cull()[0].draft(card, seed, draft.get("remark")))
+    fd, path = tempfile.mkstemp(prefix="herdr-cull-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{draft['title']}\n\n{draft['body'].strip()}\n")
+        try:
+            with open("/dev/tty") as term:
+                subprocess.call(["nvim", path], stdin=term)
+        except OSError as err:
+            print(f"  cannot run nvim: {err}")
+            return
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    finally:
+        os.unlink(path)
+    if not lines or not lines[0].strip():
+        print("  first line (the title) is empty; draft unchanged")
+        return
+    draft["title"], draft["body"] = lines[0].strip(), "\n".join(lines[1:]).strip() + "\n"
+    draft["edited"] = True
+
+
+def _pick_project(llm, draft):
+    try:
+        names = llm.projects()
+    except RuntimeError as err:
+        print(f"  cannot list projects: {err}")
+        return
+    fallback = _cull()[0].FALLBACK_PROJECT
+    names = names if fallback in names else [*names, fallback]
+    for n, name in enumerate(names, 1):
+        print(f"  {n:>3}  {name}")
+    answer = _line("project (number or name, enter keeps it): ")
+    if not answer:
+        return
+    if answer.isdigit() and 1 <= int(answer) <= len(names):
+        draft["project"] = names[int(answer) - 1]
+        return
+    match = next((name for name in names if name.lower() == answer.lower()), None)
+    if match:
+        draft["project"] = match
+    else:
+        print(f"  no open project named {answer!r}")
+
+
+def _pick_merge_target(card, others):
+    candidates = [c for c in others if c["id"] != card["id"]]
+    for n, other in enumerate(candidates, 1):
+        tickets = ", ".join(_tickets(other)) or "no ticket"
+        print(f"  {n:>3}  {_card_line(other)} {tickets}")
+    answer = _line("merge into (number, or a ticket id like GROWTH-123): ")
+    if not answer:
+        return None
+    if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+        tickets = _tickets(candidates[int(answer) - 1])
+        if not tickets:
+            print("  that tab has no ticket yet; file it first, or type a ticket id")
+            return None
+        return tickets[0]
+    if TICKET_RE.match(answer.upper()):
+        return answer.upper()
+    print(f"  {answer!r} is neither a number from the list nor a ticket id")
+    return None
+
+
+def _jump(card, popup):
+    pane = next((m["row"]["pane_id"] for m in card["members"] if m.get("row")), None)
+    if not pane:
+        print("  no open tab for this card")
+        return False
+    try:
+        ledger.call("pane.focus", {"pane_id": pane})
+    except (RuntimeError, OSError) as err:
+        print(f"  cannot focus {pane}: {err}")
+        return False
+    if not popup:
+        print(f"  focused {pane}")
+        return False
+    # The popup stays over the focused pane, so jumping from it ends the walk;
+    # notes are cached, so the next cull reaches the remaining cards quickly.
+    ledger.call("popup.close", {})
+    return True
+
+
+def _why(card):
+    sid = ((card.get("note") or {}).get("model_session")
+           or (card.get("resolved_by") or {}).get("model_session"))
+    if not sid:
+        print("  no model run behind this card")
+        return
+    print(f"  cd {ledger.MODEL_CWD} && claude --resume {sid}")
+
+
+def _walk(cards, closer, llm, keys, others=None, popup=False):
+    """One card at a time; returns how many were left undecided."""
+    remarks = _load_remarks()
+    for n, card in enumerate(cards, 1):
+        draft = {"remark": _card_remark(card, remarks)}
+        _print_card(card, n, len(cards), draft)
+        while True:
+            offered = {k: v for k, v in keys.items() if "d" != k or card.get("done_ok")}
+            key = _key("  " + "  ".join(f"{k} {v}" for k, v in offered.items()) + " > ", offered)
+            disposition, extra = None, {}
+            if "q" == key:
+                return len(cards) - n + 1
+            if key in ("k", "s"):
+                break
+            if "j" == key:
+                if _jump(card, popup):
+                    return len(cards) - n + 1
+                continue
+            if "e" == key:
+                _edit_draft(card, draft)
+                _print_card(card, n, len(cards), draft)
+                continue
+            if "p" == key:
+                _pick_project(llm, draft)
+                print(_wrap("project", draft.get("project") or card.get("project")
+                            or _cull()[0].FALLBACK_PROJECT))
+                continue
+            if "w" == key:
+                _why(card)
+                continue
+            if "n" == key:
+                text = _line("  note (kept across runs; goes into whatever is filed; "
+                             "enter keeps it, - clears): ")
+                if text:
+                    draft["remark"] = None if "-" == text else text
+                    _save_remark(card, remarks, draft["remark"])
+                    print(_wrap("you said", draft["remark"] or "(cleared)"))
+                continue
+            if "d" == key:
+                disposition = "done"
+            elif "f" == key:
+                if not card.get("note") and not draft.get("edited"):
+                    print("  no model draft; write one (title on the first line)")
+                    _edit_draft(card, draft)
+                    if not draft.get("edited"):
+                        continue
+                disposition = "filed"
+            elif "t" == key:
+                disposition = "trivial"
+            elif "x" == key:
+                hint = "enter uses your note" if draft.get("remark") else "enter cancels"
+                reason = _line(f"  why drop it? ({hint}) ") or draft.get("remark")
+                if not reason:
+                    continue
+                disposition, extra = "dropped", {"note": reason}
+            elif "m" == key:
+                ref = _pick_merge_target(card, [c for c in others or []
+                                                if c["id"] not in closer.done_ids])
+                if not ref:
+                    continue
+                disposition, extra = "merged", {"ref": ref}
+            if "ok" == closer.apply(card, _decision(disposition, draft, **extra)):
+                break
+    return 0
+
+
+# --- /close: closeable tabs check themselves; the dash answers them --------------
+
+def _close_candidates(rows):
+    """(waiting, sendable): Claude tabs already in a /close flow or ending on a report, and
+    the CLOSE-verdict ones /close could be sent to. Trivial tabs close in the sweep instead."""
+    trivial = _cull()[0]._trivial
+    flow = herdr_close.load_flow()
+    waiting, sendable = [], []
+    for row in rows:
+        rec = row.get("rec")
+        if "claude" != row.get("agent") or not rec:
+            continue
+        if rec.get("id") in flow:
+            waiting.append(row)
+            continue
+        if _held(row):
+            continue
+        text, _ = herdr_close.tail_reply(rec["file"])
+        if herdr_close.REPORT_VERDICT.search(text or ""):
+            waiting.append(row)
+        elif "CLOSE" == row["verdict"] and not trivial(row, rec):
+            sendable.append(row)
+    return waiting, sendable
+
+
+def _offer_close(rows):
+    """Pane ids the dash answers instead of a card: tabs already in a /close flow or showing
+    a report, plus the closeable ones the user agrees to send /close to."""
+    waiting, sendable = _close_candidates(rows)
+    skip = {r["pane_id"] for r in waiting}
+    if waiting:
+        print(f"{len(waiting)} tabs are in a /close flow or show a report: "
+              "the dash's REPORTS section answers them")
+    if not sendable:
+        return skip
+    print(f"\n{len(sendable)} closeable tabs can check themselves with /close:")
+    for n, row in enumerate(sendable, 1):
+        print(f" {n:>3} {shorten(row['workspace'], 19):<19} "
+              f"{shorten(row['title'] or '?', 46):<46} {row['reason']}")
+    # Each /close re-reads a long-idle session's whole context uncached, so the
+    # broadcast is chosen, not implied.
+    chosen = _pick(_line("send /close to (y all, numbers like 1-4 7, enter none): "),
+                   len(sendable))
+    if not chosen:
+        print("sent nothing; those tabs get cards instead")
+        return skip
+    sent = 0
+    for row in (sendable[n - 1] for n in chosen):
+        try:
+            herdr_close.say(ledger.call, row["pane_id"], row["rec"]["id"],
+                            herdr_close.CLOSE_PROMPT)
+        except (RuntimeError, OSError) as err:
+            print(f"  could not reach {shorten(row['title'] or '?', 40)!r}: {err}")
+            continue
+        skip.add(row["pane_id"])
+        sent += 1
+    print(f"sent /close to {sent}; answer them in the dash's REPORTS section "
+          "(prefix+m) as they land, now or later\n")
+    return skip
+
+
+def _pick(answer, count):
+    """1-based picks from "y", "all" or "1-4 7"; [] for anything else."""
+    answer = answer.strip().lower()
+    if answer in ("y", "yes", "a", "all"):
+        return list(range(1, count + 1))
+    picked = []
+    for part in re.split(r"[\s,]+", answer):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            return []
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        picked += [n for n in range(lo, hi + 1) if 1 <= n <= count and n not in picked]
+    return picked
+
+
+def _pause_if_popup(popup):
+    if popup:
+        _line("\nenter closes the popup ")
+
+
+def _held(row):
+    return row.get("focused") or row.get("status") in ("working", "blocked")
+
+
+def _verdict_rank(card):
+    ranks = [VERDICT_ORDER.index(m["row"]["verdict"]) for m in card["members"]
+             if (m.get("row") or {}).get("verdict") in VERDICT_ORDER]
+    return min(ranks) if ranks else len(VERDICT_ORDER)
+
+
+def _in_space(rows, name):
+    """Rows of the one space named exactly, or by a unique substring, ignoring case."""
+    name = name.strip().lower()
+    spaces = sorted({r["workspace"] for r in rows})
+    exact = [s for s in spaces if s.strip().lower() == name]
+    found = exact or [s for s in spaces if name in s.lower()]
+    if len(found) != 1:
+        raise SystemExit(f"herdr-sort: --space {name!r} matches "
+                         + (", ".join(map(repr, found)) if found else "no open space"))
+    return [r for r in rows if r["workspace"] == found[0]]
+
+
+def cmd_cull(args, rest):
+    popup = bool(os.environ.get("HERDR_SORT_POPUP"))
+    space = args.get("space") or os.environ.get("HERDR_SORT_SPACE")
+    try:
+        rows, index = ledger.assess()
+        rows = everyone = _numbered_stale(rows)
+        if space:
+            rows = _in_space(rows, space)
+            print(f"only {rows[0]['workspace']!r}: {len(rows)} tabs")
+        if not rows:
+            print("no open tabs")
+            return 0
+        log(f"cull start: {len(rows)} open tabs")
+        skip = _offer_close(rows)
+        cards, linear, llm = _assess([r for r in rows if r["pane_id"] not in skip], index, [],
+                                     all_rows=everyone)
+        everything = [c for c in cards if "open" == c["kind"]]
+        held = [c for c in everything if all(_held(m.get("row") or {}) for m in c["members"])]
+        cards = sorted((c for c in everything if c not in held), key=_verdict_rank)
+        if held:
+            print(f"not shown: {len(held)} working or focused: "
+                  + ", ".join(shorten(c["title"], 30) for c in held))
+        closer = _Closer(rows, index, linear)
+        auto = [c for c in cards if c.get("auto") in ("trivial", "done")]
+        if auto:
+            print(f"{len(auto)} need no decision:")
+            for card in auto:
+                why = card.get("trivial") or (card.get("note") or {}).get("outcome") or ""
+                print(f"  {card['auto']:<8} {_card_line(card)} {shorten(why, 50)}")
+            if _yes(f"close all {len(auto)} as shown? [y/N] "):
+                for card in auto:
+                    closer.apply(card, _decision(card["auto"]))
+        walk = [c for c in cards if c["id"] not in closer.done_ids]
+        left = _walk(walk, closer, llm, CULL_KEYS, others=everything, popup=popup) if walk else 0
+        kept = len(walk) - left - sum(c["id"] in closer.done_ids for c in walk)
+        print(f"\nclosed {closer.closed} tabs; kept {kept} cards"
+              + (f"; {left} not reached" if left else ""))
+        log(f"cull closed {closer.closed} tabs")
+        return 0
+    finally:
+        _pause_if_popup(popup)
+
+
+def cmd_loops(args, rest):
+    index, _ = ledger.sync()
+    try:
+        live = {r["key"] for r in ledger.live_panes() if r["key"]}
+    except (RuntimeError, OSError):
+        live = set()
+    # A reopened session is an open tab, not a loop; assess only sees that through rows.
+    events = [e for e in ledger.closes() if e.get("key") not in live]
+    cards, linear, llm = _assess([], index, events)
+    loops = [c for c in cards if "loop" == c["kind"]]
+    cleared = [c for c in loops if c.get("resolved_by")]
+    if cleared:
+        print(f"{len(cleared)} resolved by a later session:")
+        for card in cleared:
+            by = card["resolved_by"]
+            print(f"  {_card_line(card)}")
+            print(_wrap("by", f"{by.get('title') or by.get('key')} ({by.get('key')}): "
+                              f"{by.get('why') or ''}", indent=13))
+        if _yes(f"mark these {len(cleared)} resolved? [y/N] "):
+            for card in cleared:
+                by = card["resolved_by"]
+                for m in card["members"]:
+                    event = m.get("event") or {}
+                    ledger.append_resolution(
+                        m.get("key") or event.get("key"), event.get("closed_at"),
+                        {"disposition": "done",
+                         "note": f"resolved later by {by.get('title') or '?'} ({by.get('key')})",
+                         "model_session": by.get("model_session")})
+            loops = [c for c in loops if not c.get("resolved_by")]
+            print(f"marked {len(cleared)} resolved")
+    if not loops:
+        print("no open loops")
+        return 0
+    print(f"\n{len(loops)} closed sessions whose next step is still open")
+    closer = _Closer([], index, linear)
+    left = _walk(loops, closer, llm, LOOP_KEYS)
+    print(f"\nresolved {closer.resolved}; {len(loops) - len(closer.done_ids)} still open"
+          + (f" ({left} not reached)" if left else ""))
+    return 0
+
+
+def _since(text):
+    m = re.fullmatch(r"(\d+)([hdw]?)", text or "7d")
+    if not m:
+        raise SystemExit("herdr-sort: --since wants an age like 24h, 7d or 2w")
+    return int(m.group(1)) * {"h": 3600, "d": 86400, "w": 7 * 86400, "": 86400}[m.group(2)]
+
+
+def cmd_review(args, rest):
+    start = time.time() - _since(args.get("since"))
+    events = [e for e in ledger.closes() if (e.get("closed_at") or 0) >= start]
+    if not events:
+        print(f"nothing closed since {_day(start)}")
+        return 0
+    groups = {}
+    for event in events:
+        groups.setdefault(event.get("disposition") or "", []).append(event)
+    known = CLOSE_AS + ("kept",)
+    order = ([d for d in known if d in groups] + sorted(d for d in groups if d and d not in known)
+             + ([""] if "" in groups else []))
+    print(f"{len(events)} closes since {_day(start)}: "
+          + " · ".join(f"{len(groups[d])} {d or 'no disposition'}" for d in order))
+    for disposition in order:
+        print(f"\n{disposition or 'no disposition'}")
+        for event in sorted(groups[disposition], key=lambda e: e.get("closed_at") or 0):
+            print(f"  {_day(event.get('closed_at'))}  "
+                  f"{shorten(event.get('title') or '(untitled)', 56):<56} "
+                  f"{shorten(event.get('workspace') or '', 18)}")
+            parts = [event.get("ref"), event.get("ref_url"),
+                     event.get("note") and shorten(event["note"], 90)]
+            if any(parts):
+                print("         " + " · ".join(p for p in parts if p))
+    return 0
+
+
+def cmd_popup(args, rest):
+    ledger.call("plugin.pane.open", {
+        "plugin_id": "herdr-sort",
+        "entrypoint": "cull",
+        "placement": "popup",
+        "width": "90%",
+        "height": "90%",
+        "focus": True,
+        "env": dict({"HERDR_SORT_POPUP": "1"},
+                    **({"HERDR_SORT_SPACE": args["space"]} if args.get("space") else {})),
+    })
     return 0
 
 
 LEDGER_COMMANDS = {"stale": cmd_stale, "close": cmd_close, "log": cmd_log,
-                   "reopen": cmd_reopen, "ledger": cmd_ledger}
+                   "reopen": cmd_reopen, "ledger": cmd_ledger, "cull": cmd_cull,
+                   "loops": cmd_loops, "review": cmd_review, "popup": cmd_popup,
+                   "records": cmd_records}
 
 
 if __name__ == "__main__":
