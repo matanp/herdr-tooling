@@ -10,6 +10,9 @@ usage: herdr-sort <command> [options]
   unpin <target>       resume managing it
   status               daemon state, pins, last actions
   rules                parse and validate the rules file
+  replay [--sort-from A,B]
+                       re-decide every move in sort.log under the current rules (or this
+                       sort_from): same / elsewhere / stay, flagging moves undone by hand
 
   stale                KEEP / GLANCE / CLOSE for every open tab, with the reason
   close --safe         close every CLOSE tab after one confirmation (--yes skips it)
@@ -27,6 +30,7 @@ options:
   --verbose            log skip reasons too
   -n N                 log: rows to show (default 15)
   --limit N            ledger --summarize: cap the Haiku calls
+  --sort-from A,B      replay: comma-separated sort_from to use instead of the rules file
 """
 
 import fcntl
@@ -50,6 +54,7 @@ import herdr_ledger as ledger  # noqa: E402
 EXPLICIT = re.compile(r"^\s*([A-Za-z][\w-]{0,15})\s*[:·]\s*(.+?)\s*$")
 AUTO_LABEL = re.compile(r"^\d+$")
 LABEL_MAX = 44
+OWNED = "@owned"
 
 
 class Herdr:
@@ -176,17 +181,36 @@ def parse_rules(path):
         for required in ("tag", "workspace"):
             if required not in rule:
                 raise SystemExit(f"herdr-sort: {path}: rule {i} is missing {required!r}")
+        if not isinstance(rule.get("only_from", []), list):
+            raise SystemExit(f"herdr-sort: {path}: rule {i} ({rule['tag']}): "
+                             "only_from must be an array")
         try:
             compiled.append({
                 "tag": rule["tag"],
                 "workspace": rule["workspace"],
                 "title": [re.compile(p, re.I) for p in rule.get("title", [])],
                 "cwd": [re.compile(p, re.I) for p in rule.get("cwd", [])],
+                "only_from": [w.strip() for w in rule.get("only_from", [])],
             })
         except re.error as err:
             raise SystemExit(f"herdr-sort: {path}: rule {i} ({rule['tag']}): bad regex: {err}")
-    return {"sort_from": [w.strip().lower() for w in top.get("sort_from", [])],
-            "rules": compiled}
+    sort_from = top.get("sort_from", [OWNED])
+    if not isinstance(sort_from, list):
+        raise SystemExit(f"herdr-sort: {path}: sort_from must be an array")
+    return {"sort_from": check_sort_from(sort_from, path), "rules": compiled}
+
+
+def check_sort_from(values, where):
+    out = [ws_key(w) for w in values if w.strip()]
+    for value in out:
+        if value.startswith("@") and value != OWNED:
+            raise SystemExit(f"herdr-sort: {where}: sort_from: unknown {value!r} "
+                             f"(the only @ value is {OWNED!r})")
+    return out
+
+
+def ws_key(label):
+    return (label or "").strip().lower()
 
 
 def load_state():
@@ -235,21 +259,68 @@ def shorten(text, limit=LABEL_MAX):
 
 
 def classify(pane, rules):
-    """(target_workspace, tag, rest, source) or None. Explicit tags outrank rules."""
+    """((target_workspace, tag, rest, source, note), None) or (None, why nothing matched).
+
+    Explicit tags outrank rules. Otherwise the first matching rule wins, except that a
+    rule owning the tab's current workspace keeps it whenever it matches too.
+    """
     label = pane.get("tab_label") or ""
     m = EXPLICIT.match(label)
     if m:
         tag, rest = m.group(1).lower(), m.group(2)
         for rule in rules["rules"]:
             if rule["tag"].lower() == tag:
-                return rule["workspace"], rule["tag"], rest, "explicit"
+                return (rule["workspace"], rule["tag"], rest, "explicit", None), None
     probe = match_text(pane.get("terminal_title_stripped"))
     display = normalize_title(pane.get("terminal_title_stripped"))
     cwd = pane.get("cwd") or ""
-    for rule in rules["rules"]:
-        if any(p.search(probe) for p in rule["title"]) or any(p.search(cwd) for p in rule["cwd"]):
-            return rule["workspace"], rule["tag"], display, "title"
-    return None
+    here = ws_key(pane.get("workspace_label"))
+    matched = [r for r in rules["rules"] if any(p.search(probe) for p in r["title"])
+               or any(p.search(cwd) for p in r["cwd"])]
+    home = next((r for r in matched if ws_key(r["workspace"]) == here), None)
+    eligible = [r for r in matched
+                if not r["only_from"] or here in {ws_key(w) for w in r["only_from"]}]
+    if home:
+        winner = eligible[0] if eligible else home
+        note = None if winner is home else f"home rule {home['tag']} matches, over {winner['tag']}"
+        return (home["workspace"], home["tag"], display, "title", note), None
+    if eligible:
+        return (eligible[0]["workspace"], eligible[0]["tag"], display, "title", None), None
+    if matched:
+        froms = ", ".join(repr(w) for w in matched[0]["only_from"])
+        return None, f"fallback {matched[0]['tag']} drains {froms} only"
+    return None, "no rule matched"
+
+
+def blocked_source(here, rules):
+    """Why a title match may not move a tab out of `here`, or None if it may.
+
+    A workspace no rule owns was made by hand, so only an explicit sort_from entry
+    opens it: @owned never does.
+    """
+    key = ws_key(here)
+    if key in rules["sort_from"]:
+        return None
+    if not any(ws_key(r["workspace"]) == key for r in rules["rules"]):
+        return f"no rule owns {here!r}"
+    if OWNED in rules["sort_from"]:
+        return None
+    return f"not in sort_from ({here!r})"
+
+
+def route(pane, rules):
+    """The sorting decision without the live-pane guards (focus, settle, last pane):
+    (match, None) when a rule claims the tab, possibly for its own workspace, else
+    (None, why it stays)."""
+    match, reason = classify(pane, rules)
+    if not match:
+        return None, reason
+    here = pane.get("workspace_label")
+    if match[3] != "explicit" and ws_key(match[0]) != ws_key(here):
+        blocked = blocked_source(here, rules)
+        if blocked:
+            return None, blocked
+    return match, None
 
 
 def snapshot_view(herdr):
@@ -322,12 +393,12 @@ def decide(view, rules, state, settle, titles_seen, now):
             decisions.append(base)
             continue
 
-        match = classify(pane, rules)
+        match, why = route(pane, rules)
         if not match:
-            base["reason"] = "no rule matched"
+            base["reason"] = why
             decisions.append(base)
             continue
-        target_label, tag, rest, source = match
+        target_label, tag, rest, source, note = match
         base.update({"to": target_label, "tag": tag, "source": source})
 
         wanted_label = f"{tag} · {shorten(rest)}"
@@ -337,15 +408,9 @@ def decide(view, rules, state, settle, titles_seen, now):
                       or EXPLICIT.match(current_label))
         base["label"] = wanted_label if (may_rename and current_label != wanted_label) else None
 
-        same_workspace = pane["workspace_label"].strip().lower() == target_label.strip().lower()
-        if same_workspace:
+        if ws_key(pane["workspace_label"]) == ws_key(target_label):
             base["action"] = "rename" if base["label"] else "skip"
-            base["reason"] = "already in place"
-            decisions.append(base)
-            continue
-        if (source != "explicit" and rules["sort_from"]
-                and pane["workspace_label"].strip().lower() not in rules["sort_from"]):
-            base["reason"] = f"not in sort_from ({pane['workspace_label']!r})"
+            base["reason"] = note or "already in place"
             decisions.append(base)
             continue
         if pane["focused"]:
@@ -463,6 +528,68 @@ def print_table(decisions, dry_run):
         print(f"  {verb[d['action']]:<11} {title:<{width}}  {arrow:<38} {d['reason']}")
 
 
+PY_STR = r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")"""
+LOG_MOVE = re.compile(rf"^(\S+ \S+) move (\S+) {PY_STR} -> {PY_STR} as {PY_STR} "
+                      r"\(matched (\S+) by (\w+)\)$")
+LOG_PIN = re.compile(rf"^(\S+ \S+) pin (\S+) \(.*\): moved by hand to {PY_STR}, "
+                     rf"expected {PY_STR}$")
+
+
+def replay(rules):
+    """Logged labels are capped at LABEL_MAX and carry no cwd, so cwd patterns and the
+    tail of a long title cannot match here."""
+    import ast
+    moves, pins = [], []
+    with open(LOG_PATH, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if (m := LOG_MOVE.match(line)):
+                stamp, term, src, dst, label, tag, source = m.groups()
+                moves.append({"stamp": stamp, "term": term, "from": ast.literal_eval(src),
+                              "to": ast.literal_eval(dst), "label": ast.literal_eval(label),
+                              "tag": tag, "source": source})
+            elif (m := LOG_PIN.match(line)):
+                stamp, term, hand, expected = m.groups()
+                pins.append({"stamp": stamp, "term": term, "hand": ast.literal_eval(hand),
+                             "expected": ast.literal_eval(expected)})
+    counts = {"same": 0, "elsewhere": 0, "stay": 0}
+    bad_allowed = prevented = undone = 0
+    for mv in moves:
+        title = mv["label"]
+        if title.startswith(f"{mv['tag']} \u00b7 "):
+            title = title[len(mv["tag"]) + 3:]
+        title = title.rstrip("\u2026")
+        pane = {"workspace_label": mv["from"], "terminal_title_stripped": title, "cwd": "",
+                "tab_label": f"{mv['tag']}: {title}" if mv["source"] == "explicit" else ""}
+        match, why = route(pane, rules)
+        if not match or ws_key(match[0]) == ws_key(mv["from"]):
+            verdict, now = "stay", why or match[4] or "already in place"
+        elif ws_key(match[0]) == ws_key(mv["to"]):
+            verdict, now = "same", f"matched {match[1]} by {match[3]}"
+        else:
+            verdict, now = "elsewhere", f"-> {match[0]!r} ({match[1]})"
+        counts[verdict] += 1
+        pin = next((p for p in pins if p["term"] == mv["term"] and p["stamp"] >= mv["stamp"]
+                    and ws_key(p["expected"]) == ws_key(mv["to"])), None)
+        flag = ""
+        if pin:
+            undone += 1
+            # Judged against where the hand put it, not the logged target: a renamed
+            # workspace would otherwise read as "elsewhere" and pass a still-bad move.
+            if verdict == "stay" or ws_key(match[0]) == ws_key(pin["hand"]):
+                prevented += 1
+                flag = "  hand correction now prevented"
+            else:
+                bad_allowed += 1
+                flag = f"  KNOWN BAD: moved back to {pin['hand']!r} by hand"
+        print(f"  {verdict:<9} {shorten(title, 38):<38}  "
+              f"{mv['from'] + ' -> ' + mv['to']:<40} {now}{flag}")
+    print(f"{len(moves)} logged moves under sort_from={rules['sort_from']}: "
+          f"{counts['same']} same, {counts['elsewhere']} elsewhere, {counts['stay']} stay; "
+          f"{undone} undone by hand: {prevented} now prevented, {bad_allowed} still allowed")
+    return 0
+
+
 def daemon(herdr, args):
     os.makedirs(STATE_DIR, exist_ok=True)
     lock = open(LOCK_PATH, "w")
@@ -553,11 +680,12 @@ def main(argv):
     i = 2
     while i < len(argv):
         token = argv[i]
-        if token in ("--settle", "--max-moves", "--rules", "-n", "--limit"):
+        if token in ("--settle", "--max-moves", "--rules", "-n", "--limit", "--sort-from"):
             if i + 1 >= len(argv):
                 raise SystemExit(f"herdr-sort: {token} needs a value")
             key = token.lstrip("-").replace("-", "_")
-            args[key] = argv[i + 1] if token == "--rules" else int(argv[i + 1])
+            text_valued = ("--rules", "--sort-from")
+            args[key] = argv[i + 1] if token in text_valued else int(argv[i + 1])
             i += 2
             continue
         if token in ("--foreground", "--verbose", "--init", "--safe", "--yes", "--all",
@@ -576,12 +704,18 @@ def main(argv):
                 handle.write(DEFAULT_RULES)
             print(f"wrote {args['rules']}")
         rules = parse_rules(args["rules"])
-        print(f"{args['rules']}: {len(rules['rules'])} rules, "
-              f"sort_from={rules['sort_from'] or 'any'}")
+        print(f"{args['rules']}: {len(rules['rules'])} rules, sort_from={rules['sort_from']}")
         for rule in rules["rules"]:
+            only = f", only from {rule['only_from']}" if rule["only_from"] else ""
             print(f"  {rule['tag']:<6} -> {rule['workspace']:<22} "
-                  f"{len(rule['title'])} title, {len(rule['cwd'])} cwd patterns")
+                  f"{len(rule['title'])} title, {len(rule['cwd'])} cwd patterns{only}")
         return 0
+
+    if command == "replay":
+        rules = parse_rules(args["rules"])
+        if args.get("sort_from") is not None:
+            rules["sort_from"] = check_sort_from(args["sort_from"].split(","), "--sort-from")
+        return replay(rules)
 
     if command in LEDGER_COMMANDS:
         return LEDGER_COMMANDS[command](args, rest)

@@ -26,9 +26,16 @@
 # Method words (subagents, runbook, worktree, memory) are deliberately absent: they
 # describe how the work is done, so they hijack whichever project is using them.
 #
+# A rule whose workspace already holds the tab keeps it whenever it matches, wherever it
+# sits in this order.
+#
 # Saved edits are picked up by a running daemon without a restart.
 
-protect = ["All / Dump"]
+# Title matches only move a tab out of these workspaces. "@owned" adds every workspace
+# some rule's `workspace` names; a workspace no rule owns was made by hand and is only
+# sorted if listed here by name. Absent means ["@owned"]. An explicit tag moves a tab
+# from anywhere.
+sort_from = ["All / Dump"]
 
 [[rule]]
 tag = "api"
