@@ -797,7 +797,13 @@ def cmd_close(args, rest):
             raise SystemExit("herdr-sort: --self needs --as")
         if not os.environ.get("HERDR_PANE_ID"):
             raise SystemExit("herdr-sort: --self needs HERDR_PANE_ID; not running inside herdr")
-        rest = [os.environ["HERDR_PANE_ID"]]
+        # A moved pane gets a new pane_id but keeps its spawn-time HERDR_PANE_ID;
+        # herdr still resolves the old id, and terminal_id survives the move.
+        env_id = os.environ["HERDR_PANE_ID"]
+        try:
+            rest = [ledger.call("pane.get", {"pane_id": env_id})["pane"]["terminal_id"]]
+        except RuntimeError:
+            rest = [env_id]
     if not args.get("safe"):
         if not rest:
             raise SystemExit("herdr-sort: close needs --safe or pane ids / stale numbers")
