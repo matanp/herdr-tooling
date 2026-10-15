@@ -182,11 +182,11 @@ def parse_rules(path):
                 "workspace": rule["workspace"],
                 "title": [re.compile(p, re.I) for p in rule.get("title", [])],
                 "cwd": [re.compile(p, re.I) for p in rule.get("cwd", [])],
-                "only_from": [w.strip().lower() for w in rule.get("only_from", [])],
             })
         except re.error as err:
             raise SystemExit(f"herdr-sort: {path}: rule {i} ({rule['tag']}): bad regex: {err}")
-    return {"protect": top.get("protect", []), "rules": compiled}
+    return {"sort_from": [w.strip().lower() for w in top.get("sort_from", [])],
+            "rules": compiled}
 
 
 def load_state():
@@ -246,12 +246,7 @@ def classify(pane, rules):
     probe = match_text(pane.get("terminal_title_stripped"))
     display = normalize_title(pane.get("terminal_title_stripped"))
     cwd = pane.get("cwd") or ""
-    here = (pane.get("workspace_label") or "").strip().lower()
     for rule in rules["rules"]:
-        # A fallback rule only drains the inbox: a PR-numbered title carries no
-        # project word, so without this it would pull the tab out of its project.
-        if rule["only_from"] and here not in rule["only_from"]:
-            continue
         if any(p.search(probe) for p in rule["title"]) or any(p.search(cwd) for p in rule["cwd"]):
             return rule["workspace"], rule["tag"], display, "title"
     return None
@@ -348,6 +343,11 @@ def decide(view, rules, state, settle, titles_seen, now):
             base["reason"] = "already in place"
             decisions.append(base)
             continue
+        if (source != "explicit" and rules["sort_from"]
+                and pane["workspace_label"].strip().lower() not in rules["sort_from"]):
+            base["reason"] = f"not in sort_from ({pane['workspace_label']!r})"
+            decisions.append(base)
+            continue
         if pane["focused"]:
             base["reason"] = "focused; deferred"
             decisions.append(base)
@@ -360,12 +360,10 @@ def decide(view, rules, state, settle, titles_seen, now):
             base["reason"] = f"title unsettled ({int(now - entry[1])}s of {settle}s)"
             decisions.append(base)
             continue
-        # Emptying a workspace closes it and renumbers the rest, so a protected
-        # workspace always keeps its last pane.
-        protected = pane["workspace_label"].strip().lower() in {
-            p.strip().lower() for p in rules["protect"]}
-        if protected and remaining[pane["workspace_id"]] <= 1:
-            base["reason"] = f"last pane in protected {pane['workspace_label']!r}"
+        # Emptying a workspace closes it and renumbers the rest, so every
+        # workspace keeps its last pane.
+        if remaining[pane["workspace_id"]] <= 1:
+            base["reason"] = f"last pane in {pane['workspace_label']!r}"
             decisions.append(base)
             continue
 
@@ -525,7 +523,7 @@ DEFAULT_RULES = '''# herdr-sort rules -- first match wins.
 #
 # Saved edits are picked up by a running daemon without a restart.
 
-protect = ["All / Dump"]
+sort_from = ["All / Dump"]
 
 [[rule]]
 tag = "api"
@@ -578,7 +576,8 @@ def main(argv):
                 handle.write(DEFAULT_RULES)
             print(f"wrote {args['rules']}")
         rules = parse_rules(args["rules"])
-        print(f"{args['rules']}: {len(rules['rules'])} rules, protect={rules['protect']}")
+        print(f"{args['rules']}: {len(rules['rules'])} rules, "
+              f"sort_from={rules['sort_from'] or 'any'}")
         for rule in rules["rules"]:
             print(f"  {rule['tag']:<6} -> {rule['workspace']:<22} "
                   f"{len(rule['title'])} title, {len(rule['cwd'])} cwd patterns")
