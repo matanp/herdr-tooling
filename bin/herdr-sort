@@ -55,6 +55,8 @@ EXPLICIT = re.compile(r"^\s*([A-Za-z][\w-]{0,15})\s*[:·]\s*(.+?)\s*$")
 AUTO_LABEL = re.compile(r"^\d+$")
 LABEL_MAX = 44
 OWNED = "@owned"
+# Titles an agent shows before the session names itself: they say nothing about the work.
+DEFAULT_IGNORE_TITLES = ["Claude Code", "codex", "opencode"]
 
 
 class Herdr:
@@ -197,7 +199,11 @@ def parse_rules(path):
     sort_from = top.get("sort_from", [OWNED])
     if not isinstance(sort_from, list):
         raise SystemExit(f"herdr-sort: {path}: sort_from must be an array")
-    return {"sort_from": check_sort_from(sort_from, path), "rules": compiled}
+    ignore_titles = top.get("ignore_titles", DEFAULT_IGNORE_TITLES)
+    if not isinstance(ignore_titles, list):
+        raise SystemExit(f"herdr-sort: {path}: ignore_titles must be an array")
+    return {"sort_from": check_sort_from(sort_from, path), "rules": compiled,
+            "ignore_titles": {t.strip().lower() for t in ignore_titles}}
 
 
 def check_sort_from(values, where):
@@ -315,6 +321,8 @@ def route(pane, rules):
     match, reason = classify(pane, rules)
     if not match:
         return None, reason
+    if match[3] != "explicit" and match[2].lower() in rules["ignore_titles"]:
+        return None, f"default title {match[2]!r}"
     here = pane.get("workspace_label")
     if match[3] != "explicit" and ws_key(match[0]) != ws_key(here):
         blocked = blocked_source(here, rules)
@@ -704,7 +712,8 @@ def main(argv):
                 handle.write(DEFAULT_RULES)
             print(f"wrote {args['rules']}")
         rules = parse_rules(args["rules"])
-        print(f"{args['rules']}: {len(rules['rules'])} rules, sort_from={rules['sort_from']}")
+        print(f"{args['rules']}: {len(rules['rules'])} rules, sort_from={rules['sort_from']}, "
+              f"ignore_titles={sorted(rules['ignore_titles'])}")
         for rule in rules["rules"]:
             only = f", only from {rule['only_from']}" if rule["only_from"] else ""
             print(f"  {rule['tag']:<6} -> {rule['workspace']:<22} "

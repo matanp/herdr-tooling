@@ -37,6 +37,10 @@
 # from anywhere.
 sort_from = ["All / Dump"]
 
+# A tab whose title is exactly one of these (case-insensitive) is left alone until the
+# session names itself; an explicit tag still moves it. Absent means this list.
+ignore_titles = ["Claude Code", "codex", "opencode"]
+
 [[rule]]
 tag = "api"
 workspace = "Public API"
