@@ -55,6 +55,11 @@ Tool state and logs go to `~/.local/state/herdr-*/`.
 - **`herdr-sessions`** — table of open agent sessions; `--watch`, `--json`, `--status blocked`.
 - **`herdr-sort`** — routes tabs into workspaces by session title (`sort-rules.toml`);
   KEEP / GLANCE / CLOSE ratings, close with a reopenable ledger.
+  Title moves only leave the spaces in `sort_from`; `@owned` means every space a rule
+  names, so a hand-made space is never title-sorted. The current space's rule wins ties,
+  pr / docs / arch drain All / Dump only, and default titles (`ignore_titles`) are skipped.
+  A typed tag moves a tab from anywhere. `herdr-sort replay` re-runs logged moves under
+  the current rules and flags any you corrected by hand: run it before widening a rule.
   - Every close takes a disposition: `done`, `filed`, `merged`, `dropped` (needs `--note`),
     `trivial`. `close --as <d> [--ref GROWTH-n] [--note ...] <tabs>`; bare `close` refuses.
   - `done` / `filed` / `merged` go to Linear first (comment on a referenced issue, else a new
