@@ -108,14 +108,23 @@ project directory is often another session's.
 
 Then give the close command, built from the verdict:
 
-    herdr-sort close --as <disposition> [--ref <ticket>] [--note "<one line>"] --yes --self
+    herdr-sort close --as <disposition> [--ref <ticket>] [--note "<one line>"]
+        [--remove-worktree <path>] --yes --self
 
 and ask for a go-ahead as a bare yes/no question, such as "Run it?". The user often answers a
 batch of tabs with one "yes", so anything else bundled onto that line goes unanswered. An
-optional `--ref`, a cleanup or a side offer belongs in the open items or in a keep. On a yes, run it as your **last tool call** — it closes this pane, and
+optional `--ref`, any other cleanup or a side offer belongs in the open items or in a keep. On a yes, run it as your **last tool call** — it closes this pane, and
 the Linear write happens before the pane goes. `--self` is what lets it close the focused tab;
 a pane id in its place is refused as "the tab you're in", with nothing written. The report must already be in an earlier turn for
 `herdr-sort` to read it, which is why the command never runs in the same turn as the report.
+
+Give the command on one line (`herdr-sort cull` reads it from there). Add `--remove-worktree <path>` when the session worked in a linked worktree
+(not a main checkout) whose `git -C <path> status --short --untracked-files=no` is empty and whose
+HEAD is pushed or merged (`git -C <path> for-each-ref --contains HEAD refs/remotes` prints a ref).
+Leave it off when another session works there or an installed copy links into it. The flag is a
+proposal: the user's yes to the command approves it, and the dash card shows it. herdr-sort
+re-checks, tags unreachable commits and copies untracked files out before removing, and refuses
+the whole close, writing nothing, when a check fails. Never run `git worktree remove` yourself.
 
 When `HERDR_PANE_ID` is unset, the session is not in herdr: deliver the report and stop.
 
