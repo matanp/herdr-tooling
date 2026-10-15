@@ -384,6 +384,8 @@ def _report_detail(item):
         text = "wants: " + (rep["ask"] or (rep["items"][0][1] if rep["items"] else "?"))
     else:
         text = "next: " + (rep["next"] or "?")
+    if rep.get("worktree"):
+        text += f"  · removes worktree {os.path.basename(rep['worktree'].rstrip('/'))}"
     if rep["side"]:
         text += "  · also asks something"
     return text + (f"  · {fails} FAIL" if fails else "")

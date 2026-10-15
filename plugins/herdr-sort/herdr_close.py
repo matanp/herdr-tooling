@@ -179,6 +179,7 @@ def report(text):
     keep = verdict is not None and not verdict.lower().startswith("close")
     kind = "keep" if keep else "offer" if command else "reply"
     disposition = re.search(r"--as\s+(\w+)", command or "")
+    worktree = re.search(r"--remove-worktree\s+(\S+)", command or "")
     nxt = REPORT_NEXT.search(text)
     # The ask is the last paragraph that is prose: not the command, and not the report's
     # **Field:** lines or its "- [fail]" items, which the card shows on their own.
@@ -189,6 +190,7 @@ def report(text):
     items = sorted(REPORT_ITEM.findall(text), key=lambda i: 0 if "fail" == i[0].lower() else 1)
     return {"kind": kind, "verdict": verdict, "command": command,
             "disposition": disposition.group(1) if disposition else None,
+            "worktree": worktree.group(1).strip("'\"") if worktree else None,
             "next": nxt.group(1).strip() if nxt else None, "items": items, "ask": ask,
             # "Run it?" alone is the go-ahead; anything longer bundles a second question
             # that a bare "yes" would leave unanswered.

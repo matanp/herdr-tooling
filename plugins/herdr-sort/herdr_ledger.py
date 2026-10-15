@@ -34,7 +34,7 @@ CODEX_GLOBS = [os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl"),
 # SUMMARY_CWD holds the retired Haiku summaries' runs.
 SUMMARY_CWD = os.path.join(STATE_DIR, "summarize")
 MODEL_CWD = os.path.join(STATE_DIR, "cull-runs")
-CLOSE_FIELDS = ("disposition", "note", "ref", "ref_url", "model_session")
+CLOSE_FIELDS = ("disposition", "note", "ref", "ref_url", "model_session", "worktree")
 
 ENGAGED_GAP_S = 1800
 ENGAGED_CAP_S = 300

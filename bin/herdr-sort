@@ -20,6 +20,10 @@ usage: herdr-sort <command> [options]
                        done/filed/merged go to Linear first, and a Linear failure closes nothing
   close --as D --self  close the calling pane ($HERDR_PANE_ID), focused or not: how a
                        session closes itself once its close report is written
+  close --as D --self --remove-worktree PATH
+                       also remove the session's linked worktree, after the close is recorded;
+                       refused (nothing written) unless it is clean and its HEAD is pushed or
+                       merged. Unreachable commits are tagged and untracked files copied first
   close --safe         the CLOSE group after one confirmation (--yes skips it): trivial
                        ones as trivial, verified-done ones as done, the rest listed and
                        left open; with --as D, all of it as D
@@ -88,6 +92,7 @@ sys.path.insert(0, _REPO_PLUGIN if os.path.isdir(_REPO_PLUGIN)
                 else os.path.expanduser("~/.local/share/herdr-plugins/herdr-sort"))
 import herdr_close  # noqa: E402
 import herdr_ledger as ledger  # noqa: E402
+import herdr_worktree  # noqa: E402
 
 EXPLICIT = re.compile(r"^\s*([A-Za-z][\w-]{0,15})\s*[:·]\s*(.+?)\s*$")
 AUTO_LABEL = re.compile(r"^\d+$")
@@ -759,12 +764,13 @@ def main(argv):
     while i < len(argv):
         token = argv[i]
         if token in ("--settle", "--max-moves", "--rules", "-n",
-                     "--as", "--ref", "--note", "--since", "--space", "--sort-from"):
+                     "--as", "--ref", "--note", "--since", "--space", "--sort-from",
+                     "--remove-worktree"):
             if i + 1 >= len(argv):
                 raise SystemExit(f"herdr-sort: {token} needs a value")
             key = token.lstrip("-").replace("-", "_")
             text_valued = ("--rules", "--as", "--ref", "--note", "--since", "--space",
-                           "--sort-from")
+                           "--sort-from", "--remove-worktree")
             args[key] = argv[i + 1] if token in text_valued else int(argv[i + 1])
             i += 2
             continue
@@ -931,6 +937,10 @@ def cmd_close(args, rest):
         raise SystemExit('herdr-sort: --as dropped needs --note "why it was abandoned"')
     if "merged" == disposition and not args.get("ref"):
         raise SystemExit("herdr-sort: --as merged needs --ref <the surviving tab's ticket>")
+    worktree = args.get("remove_worktree")
+    if worktree is not None and not args.get("self"):
+        raise SystemExit("herdr-sort: --remove-worktree goes with --self: a session removes "
+                         "only its own worktree")
     if args.get("self"):
         if args.get("safe") or rest:
             raise SystemExit("herdr-sort: --self closes only the calling pane; "
@@ -989,6 +999,18 @@ def cmd_close(args, rest):
     for card, chosen_as in plan:
         why = card.get("trivial") or (card.get("note") or {}).get("outcome") or ""
         print(f"  {chosen_as:<8} {_card_line(card)} {shorten(why, 60)}")
+    before_close = None
+    if worktree is not None and plan:
+        self_ids = {m["row"]["pane_id"] for card, _ in plan for m in card["members"]
+                    if m.get("row")}
+        other_cwds = [r.get("cwd") for r in rows if r["pane_id"] not in self_ids]
+        before_close = lambda: _remove_worktree(worktree, other_cwds)  # noqa: E731
+        try:
+            info = herdr_worktree.check(worktree, other_cwds)
+            print(f"  and removes worktree {herdr_worktree.describe(info)}")
+        except herdr_worktree.Refused as err:
+            raise SystemExit(f"herdr-sort: not closing, nothing written: --remove-worktree "
+                             f"refused: {err}\n  drop --remove-worktree to close and keep it")
     if left:
         print("\nleft open, each needs a decision (`herdr-sort cull`, or close --as):")
         for card in left:
@@ -998,7 +1020,7 @@ def cmd_close(args, rest):
     if not args.get("yes") and not _confirm(f"close these {len(plan)} as shown? [y/N] "):
         print("nothing closed")
         return 1
-    closer = _Closer(rows, index, linear)
+    closer = _Closer(rows, index, linear, before_close=before_close)
     for card, chosen_as in plan:
         decision = _decision(chosen_as, note=args.get("note"), ref=args.get("ref"))
         if "failed" == closer.apply(card, decision):
@@ -1287,8 +1309,8 @@ class _Closer:
     ledger.close would then refuse to close.
     """
 
-    def __init__(self, rows, index, linear):
-        self.index, self.linear = index, linear
+    def __init__(self, rows, index, linear, before_close=None):
+        self.index, self.linear, self.before_close = index, linear, before_close
         self.records = _records()[0]
         self.remaining = {r["workspace_id"]: r["workspace_panes"] for r in rows}
         self.closed, self.resolved, self.done_ids = 0, 0, set()
@@ -1337,6 +1359,10 @@ class _Closer:
         for row in rows:
             row["workspace_panes"] = self.remaining[row["workspace_id"]]
         extra = {f["pane_id"]: f for f in fields if f.get("pane_id")}
+        if self.before_close:
+            outcome = self.before_close()
+            for row in rows:
+                extra.setdefault(row["pane_id"], {})["worktree"] = outcome
         store = self.records.load()
         frozen = {r["key"]: self.records.close_fields(r["key"], store)
                   for r in rows if r.get("key")}
@@ -1351,6 +1377,20 @@ class _Closer:
         print(f"  {decision['disposition']}" + (f" -> {ref}" if ref else "")
               + f"; closed {len(done)} of {len(rows)}")
         return "ok"
+
+
+def _remove_worktree(path, other_cwds):
+    """Runs after the close is recorded and before the pane goes. A refusal here leaves the
+    worktree and still closes the tab: the outcome lands in the close event and sort.log."""
+    outcome = herdr_worktree.remove(path, other_cwds)
+    if outcome["removed"]:
+        log(f"removed worktree {outcome['path']} at {outcome['head'][:12]}"
+            f" tags={outcome['tags']} untracked_saved={outcome['untracked_saved']}")
+        print(f"  removed worktree {outcome['path']}")
+    else:
+        log(f"kept worktree {path}: {outcome['reason']}")
+        print(f"  kept worktree {path}: {outcome['reason']}")
+    return outcome
 
 
 def _card_line(card):
