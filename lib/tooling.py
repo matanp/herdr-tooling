@@ -27,9 +27,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 #   bin       repo files linked into ~/.local/bin (src, installed name)
 #   plugin    repo plugin directory linked into ~/.local/share/herdr-plugins
 #   keys      fragment under config/keys/ appended to config.toml
+#   skill     repo skill directory linked into ~/.claude/skills
 #   requires  components that must also be on
 #   linux     reads /proc on its critical path; skipped elsewhere
 COMPONENTS = {
+    # On, every rendered binding runs through `herdr-keys run KEY --`.
+    "keys": {"bin": [("bin/herdr-keys", "herdr-keys")], "plugin": "herdr-keys"},
     "compose": {"bin": [("bin/herdr-compose", "herdr-compose")],
                 "keys": "compose.toml"},
     "ccnav": {"bin": [("bin/ccnav-herdr", "ccnav-herdr")],
@@ -37,6 +40,8 @@ COMPONENTS = {
     "sessions": {"bin": [("bin/herdr-sessions", "herdr-sessions")], "linux": True},
     "sort": {"bin": [("bin/herdr-sort", "herdr-sort")], "plugin": "herdr-sort"},
     "dash": {"plugin": "herdr-dash", "keys": "dash.toml"},
+    # Keys only: the prsessions plugin is installed outside this repo.
+    "prsessions": {"keys": "prsessions.toml"},
     "viewer": {"plugin": "viewer", "keys": "viewer.toml"},
     "space-scope": {"bin": [("plugins/space-scope/space-scope", "herdr-space-scope")],
                     "plugin": "space-scope", "keys": "space-scope.toml"},

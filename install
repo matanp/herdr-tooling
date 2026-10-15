@@ -23,6 +23,7 @@ when a pull adds a component. Safe to re-run.
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -223,6 +224,15 @@ def remap(block, keys):
     return block
 
 
+def counted(block):
+    """The block with its shell command wrapped in `herdr-keys run KEY --`."""
+    key = re.search(r'^key = "([^"]+)"', block, re.M)
+    if not key or not re.search(r'^type = "shell"', block, re.M):
+        return block
+    wrap = f"~/.local/bin/herdr-keys run {key.group(1)} -- "
+    return re.sub(r'^command = "', lambda m: m.group(0) + wrap, block, count=1, flags=re.M)
+
+
 def render(on, config):
     keys = config.get("keys", {})
     with open(local_source()) as fh:
@@ -237,6 +247,8 @@ def render(on, config):
         with open(os.path.join(REPO, "config", "keys", spec["keys"])) as fh:
             head, cmds = blocks(fh.read())
         cmds = [b for b in (remap(b, keys) for b in cmds) if b]
+        if "keys" in on:
+            cmds = [counted(b) for b in cmds]
         if cmds:
             parts.append(head.rstrip() + "\n\n" + "".join(cmds).rstrip() + "\n")
     return "\n".join(parts)

@@ -1,0 +1,7 @@
+# prsessions plugin — PRs the focused session touched and the other sessions behind
+# them; enter jumps to a live one or resumes it in a new tab.
+
+[[keys.command]]
+key = "prefix+t"           # PR sessions popup
+type = "shell"
+command = "~/.local/share/herdr-plugins/prsessions/prs popup"

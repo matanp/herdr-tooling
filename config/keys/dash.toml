@@ -7,3 +7,9 @@
 key = "prefix+m"           # dashboard popup
 type = "shell"
 command = "~/.local/share/herdr-plugins/herdr-dash/run popup"
+
+# A "dash" tab of three dash panes; focuses it if one exists in any space.
+[[keys.command]]
+key = "prefix+shift+m"     # dashboard split tab
+type = "shell"
+command = "~/.local/share/herdr-plugins/herdr-dash/run split"

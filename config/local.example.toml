@@ -15,6 +15,9 @@ prefix = "ctrl+b"
 agent_panel_sort = "spaces"
 show_agent_labels_on_pane_borders = true
 
+[ui.sidebar.agents]
+rows = [[{ token = "tab", fg = "#fdf6e3", bold = true }], ["state_icon", { token = "$elapsed", dim = true }, { token = "agent", dim = true }]]
+
 [ui.toast]
 delivery = "off"
 
