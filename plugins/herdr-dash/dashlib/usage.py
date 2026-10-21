@@ -7,7 +7,10 @@ A ccusage run takes from one to several seconds, and collect() runs on every
 refresh tick alongside sections that take milliseconds. So collect() only reads
 a cache file; a stale cache kicks off a detached `usage.py refresh`, which
 outlives the popup that spawned it and is single-flighted by a lock file across
-every open dash.
+every open dash. Cron also runs `usage.py refresh --if-active` every TTL_S.
+
+A cache with no transcript written since it counts as fresh at any age: no
+transcript write means no new spend, so idle hours run ccusage zero times.
 """
 
 import datetime
@@ -19,7 +22,8 @@ import time
 
 CCUSAGE = "~/.local/share/pnpm/ccusage"
 STATE = "~/.local/state/herdr-dash"
-TTL_S = 120
+TRANSCRIPTS = "~/.claude/projects"
+TTL_S = 1800
 LOCK_STALE_S = 90
 
 
@@ -91,20 +95,36 @@ def _read():
         return None
 
 
-def _spawn_refresh():
+def _idle(data):
+    if not data or data.get("error") or data.get("date") != datetime.date.today().isoformat():
+        return False
+    # Fails toward refreshing: find erroring or printing anything counts as activity.
+    proc = subprocess.run(["find", os.path.expanduser(TRANSCRIPTS), "-name", "*.jsonl",
+                           "-newer", _path("usage.json"), "-print", "-quit"],
+                          capture_output=True, text=True, timeout=10)
+    return not proc.returncode and not proc.stdout.strip()
+
+
+def _take_lock():
     lock = _path("usage.lock")
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     try:
         if time.time() - os.path.getmtime(lock) < LOCK_STALE_S:
-            return
+            return False
         os.unlink(lock)
     except FileNotFoundError:
         pass
     try:
         os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
     except FileExistsError:
+        return False
+    return True
+
+
+def _spawn_refresh():
+    if not _take_lock():
         return
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "refresh"],
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "refresh", "--locked"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -113,12 +133,17 @@ def collect():
     data = _read()
     fresh = (data and data.get("date") == datetime.date.today().isoformat()
              and time.time() - data.get("fetched_at", 0) < TTL_S)
-    if not fresh:
+    if not fresh and not _idle(data):
         _spawn_refresh()
     return data or {"pending": True}
 
 
-if "__main__" == __name__ and sys.argv[1:] == ["refresh"]:
+if "__main__" == __name__ and sys.argv[1:2] == ["refresh"]:
+    flags = sys.argv[2:]
+    if "--if-active" in flags and _idle(_read()):
+        sys.exit(0)
+    if "--locked" not in flags and not _take_lock():
+        sys.exit(0)
     try:
         refresh()
     finally:
